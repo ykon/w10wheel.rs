@@ -401,6 +401,26 @@ unsafe extern "system" {
 unsafe extern "system" {
     fn EndMenu() -> i32;
     fn PostThreadMessageW(thread: u32, msg: u32, wparam: usize, lparam: isize) -> i32;
+    fn EnumThreadWindows(
+        thread: u32,
+        callback: unsafe extern "system" fn(Handle, isize) -> i32,
+        lparam: isize,
+    ) -> i32;
+    fn GetClassNameW(hwnd: Handle, class_name: *mut u16, max_count: i32) -> i32;
+}
+
+/// The dialogs of Windows on this thread (class "#32770": the file dialog of the excluded
+/// programs) are canceled, as their Cancel button would
+unsafe extern "system" fn cancel_system_dialog(hwnd: Handle, _: isize) -> i32 {
+    let mut buf = [0u16; 16];
+    let len = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+    if len > 0
+        && String::from_utf16_lossy(&buf[..len as usize]) == "#32770"
+        && unsafe { IsWindowVisible(hwnd) } != 0
+    {
+        unsafe { PostMessageW(hwnd, WM_COMMAND, 2 /* IDCANCEL */, 0) };
+    }
+    1
 }
 
 #[link(name = "user32")]
@@ -871,6 +891,8 @@ pub(crate) fn end_modals() {
     END_MODALS.with(|e| e.set(true));
     unsafe {
         EndMenu();
+        // The file dialog of Windows runs its own loop, which the flag above does not end
+        EnumThreadWindows(GetCurrentThreadId(), cancel_system_dialog, 0);
         // Wakes the loops waiting in GetMessage, which then see it
         PostThreadMessageW(GetCurrentThreadId(), 0 /* WM_NULL */, 0, 0);
     }

@@ -583,19 +583,29 @@ pub fn validate_new_profile_name(dir: &Path, name: &str) -> Result<(), ProfileNa
     Ok(())
 }
 
-pub fn copy_profile(dir: &Path, src: &str, dest: &str) -> io::Result<()> {
-    let src_path = profile_path(dir, src);
-    let dest_path = profile_path(dir, dest);
-    fs::copy(src_path, &dest_path)?;
-    if let Ok(meta) = fs::metadata(&dest_path) {
-        let mut perms = meta.permissions();
-        if perms.readonly() {
-            #[allow(clippy::permissions_set_readonly_false)]
-            perms.set_readonly(false);
-            let _ = fs::set_permissions(&dest_path, perms);
+/// The properties file of new properties made at `dest`, only if there is none (create_new): the
+/// name is reserved at once, so a file made there by another program since the name was checked is
+/// not replaced (an AlreadyExists error), as .NET File.Copy fails. It has the contents of `src` if
+/// that exists (its comments, its other keys; not its attributes, e.g. read-only): true then, else
+/// it is empty (false). Removed again if the copy fails.
+fn create_profile_file(src: &Path, dest: &Path) -> io::Result<bool> {
+    let mut file = OpenOptions::new().write(true).create_new(true).open(dest)?;
+    let copied = (|| -> io::Result<bool> {
+        match fs::read(src) {
+            Ok(bytes) => {
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                Ok(true)
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err),
         }
+    })();
+    drop(file);
+    if copied.is_err() {
+        let _ = fs::remove_file(dest);
     }
-    Ok(())
+    copied
 }
 
 pub fn delete_profile(dir: &Path, name: &str) -> io::Result<()> {
@@ -973,16 +983,28 @@ impl ConfigStore {
         let current = self.config.to_property_map();
         let all_keys: Vec<String> = current.keys().cloned().collect();
 
+        let lang = self.lang();
         let mut made_prop = false;
         let write_result = (|| -> io::Result<()> {
-            if src_path.is_file() {
-                copy_profile(&dir, &self.selected, name)?;
-                made_prop = true;
-            }
-            if made_prop || dest_path.exists() {
+            // Made by another program since the name was checked: not replaced (its contents
+            // would be lost), the Add fails as for a name that exists
+            let copied = create_profile_file(&src_path, &dest_path).map_err(|err| {
+                if err.kind() == io::ErrorKind::AlreadyExists {
+                    io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        crate::locale::tr(
+                            lang,
+                            crate::locale::profile_name_error_key(ProfileNameError::AlreadyExists),
+                        ),
+                    )
+                } else {
+                    err
+                }
+            })?;
+            made_prop = true;
+            if copied {
                 PropertiesFile::update_keys(&dest_path, &current, &all_keys)?;
             } else {
-                made_prop = true;
                 PropertiesFile::store_map(&dest_path, &current)?;
             }
             // The excluded programs running, always, as .NET (Ctx.addProperties): an exclusions
@@ -1655,6 +1677,29 @@ mod tests {
         drop(lock);
         assert!(!profile_path(&dir2.0, "Home").exists());
         assert_eq!(store2.selected_profile(), DEFAULT_PROFILE);
+        Ok(())
+    }
+
+    #[test]
+    fn a_properties_file_made_by_another_program_meanwhile_is_not_replaced() -> io::Result<()> {
+        let dir = TestDir::new()?;
+        let src = profile_path(&dir.0, DEFAULT_PROFILE);
+        fs::write(&src, "# mine\r\nreverseScroll=true\r\n")?;
+
+        // Made by another program after the name was checked
+        let dest = profile_path(&dir.0, "Work");
+        fs::write(&dest, "# theirs\r\n")?;
+        let err = create_profile_file(&src, &dest).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&dest)?, "# theirs\r\n");
+
+        // Free: a copy of the source (its comments too), or empty without one
+        let free = profile_path(&dir.0, "Home");
+        assert!(create_profile_file(&src, &free)?);
+        assert_eq!(fs::read_to_string(&free)?, "# mine\r\nreverseScroll=true\r\n");
+        let empty = profile_path(&dir.0, "Empty");
+        assert!(!create_profile_file(&dir.0.join("missing.properties"), &empty)?);
+        assert_eq!(fs::read(&empty)?.len(), 0);
         Ok(())
     }
 

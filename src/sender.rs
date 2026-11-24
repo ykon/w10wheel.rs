@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -181,10 +182,25 @@ enum ButtonAction {
 enum SenderMsg {
     Wheel { event: WheelEvent, generation: u64 },
     Button(ButtonAction),
-    Pause(bool),
-    BumpGeneration(u64),
     BeginClose,
     Close(mpsc::Sender<()>),
+}
+
+/// Pause and the generation of the wheel events that may be sent, set by the hook thread and read
+/// by the sender when it sends a wheel event, as .NET (Windows.sendUnlessPassMode): not queued
+/// behind the wheel events, which would be sent before them (e.g. after Pause was turned on, or the
+/// scroll mode they were for has ended)
+#[derive(Default)]
+struct SendGate {
+    paused: AtomicBool,
+    valid_generation: AtomicU64,
+}
+
+impl SendGate {
+    fn allows_wheel(&self, generation: u64) -> bool {
+        !self.paused.load(Ordering::Acquire)
+            && self.valid_generation.load(Ordering::Acquire) == generation
+    }
 }
 
 struct PendingUp {
@@ -204,6 +220,7 @@ struct UnsentUp {
 #[derive(Clone)]
 pub struct InputSenderHandle {
     tx: mpsc::Sender<SenderMsg>,
+    gate: Arc<SendGate>,
 }
 
 impl InputSenderHandle {
@@ -250,12 +267,14 @@ impl InputSenderHandle {
         }));
     }
 
+    /// At once: the wheel events still queued are not sent any more
     pub fn set_paused(&self, paused: bool) {
-        let _ = self.tx.send(SenderMsg::Pause(paused));
+        self.gate.paused.store(paused, Ordering::Release);
     }
 
+    /// At once: the wheel events still queued for an earlier generation are not sent any more
     pub fn set_generation(&self, generation: u64) {
-        let _ = self.tx.send(SenderMsg::BumpGeneration(generation));
+        self.gate.valid_generation.store(generation, Ordering::Release);
     }
 
     pub fn begin_close(&self) {
@@ -279,12 +298,14 @@ impl InputSender {
         retry_interval: Duration,
     ) -> Self {
         let (tx, rx) = mpsc::channel();
+        let gate = Arc::new(SendGate::default());
+        let worker_gate = Arc::clone(&gate);
         let join = thread::Builder::new()
             .name("w10wheel-sender".to_owned())
-            .spawn(move || run_sender_loop(rx, sink, click_delay, retry_interval))
+            .spawn(move || run_sender_loop(rx, sink, worker_gate, click_delay, retry_interval))
             .expect("failed to spawn input sender thread");
         Self {
-            handle: InputSenderHandle { tx },
+            handle: InputSenderHandle { tx, gate },
             join: Some(join),
         }
     }
@@ -319,8 +340,7 @@ struct SenderWorker<S: SendSink> {
     sink: S,
     click_delay: Duration,
     retry_interval: Duration,
-    paused: bool,
-    valid_generation: u64,
+    gate: Arc<SendGate>,
     closing: bool,
     pending_up: Option<PendingUp>,
     button_queue: VecDeque<ButtonAction>,
@@ -340,13 +360,12 @@ fn press_id_of(extra_info: usize) -> u32 {
 }
 
 impl<S: SendSink> SenderWorker<S> {
-    fn new(sink: S, click_delay: Duration, retry_interval: Duration) -> Self {
+    fn new(sink: S, gate: Arc<SendGate>, click_delay: Duration, retry_interval: Duration) -> Self {
         Self {
             sink,
             click_delay,
             retry_interval,
-            paused: false,
-            valid_generation: 0,
+            gate,
             closing: false,
             pending_up: None,
             button_queue: VecDeque::new(),
@@ -376,7 +395,8 @@ impl<S: SendSink> SenderWorker<S> {
     fn handle_message(&mut self, msg: SenderMsg) -> Option<mpsc::Sender<()>> {
         match msg {
             SenderMsg::Wheel { event, generation } => {
-                if !self.paused && !self.closing && generation == self.valid_generation {
+                // Pause and the generation as they are now, not when the event was queued
+                if !self.closing && self.gate.allows_wheel(generation) {
                     let (axis, delta) = match event {
                         WheelEvent::Vertical(delta) => (ScrollAxis::Vertical, delta),
                         WheelEvent::Horizontal(delta) => (ScrollAxis::Horizontal, delta),
@@ -388,14 +408,6 @@ impl<S: SendSink> SenderWorker<S> {
             SenderMsg::Button(action) => {
                 self.button_queue.push_back(action);
                 self.drain_buttons();
-                None
-            }
-            SenderMsg::Pause(paused) => {
-                self.paused = paused;
-                None
-            }
-            SenderMsg::BumpGeneration(generation) => {
-                self.valid_generation = generation;
                 None
             }
             SenderMsg::BeginClose => {
@@ -599,10 +611,11 @@ impl<S: SendSink> SenderWorker<S> {
 fn run_sender_loop(
     rx: mpsc::Receiver<SenderMsg>,
     sink: impl SendSink,
+    gate: Arc<SendGate>,
     click_delay: Duration,
     retry_interval: Duration,
 ) {
-    let mut worker = SenderWorker::new(sink, click_delay, retry_interval);
+    let mut worker = SenderWorker::new(sink, gate, click_delay, retry_interval);
 
     loop {
         worker.process_deadlines(Instant::now());
@@ -701,6 +714,89 @@ mod tests {
         );
     }
 
+    /// A sink whose first send waits until the test releases it: the sender thread stalls (e.g.
+    /// SendInput slow) while the events after it stay queued
+    struct HeldSink {
+        packets: Arc<Mutex<Vec<SendPacket>>>,
+        hold: Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>,
+    }
+
+    impl SendSink for HeldSink {
+        fn send(&mut self, packet: SendPacket) -> bool {
+            if let Some((entered, release)) = self.hold.take() {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
+            self.packets.lock().unwrap().push(packet);
+            true
+        }
+    }
+
+    /// Returns the sender (its first send held once the test has seen it: `entered`), the packets
+    /// sent, and the release of the held send
+    fn start_held() -> (InputSender, Arc<Mutex<Vec<SendPacket>>>, mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let packets = Arc::new(Mutex::new(Vec::new()));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let sink = HeldSink {
+            packets: Arc::clone(&packets),
+            hold: Some((entered_tx, release_rx)),
+        };
+        let sender = InputSender::start_with_intervals(
+            sink,
+            Duration::from_millis(5),
+            Duration::from_millis(20),
+        );
+        (sender, packets, entered_rx, release_tx)
+    }
+
+    #[test]
+    fn queued_wheel_events_are_not_sent_after_pause_or_the_end_of_their_scroll() {
+        // Pause turned on while wheel events are still queued: none of them is sent
+        let (mut sender, packets, entered, release) = start_held();
+        let handle = sender.handle();
+        handle.send_wheel(WheelEvent::Vertical(1), 0); // held in the sink
+        handle.send_wheel(WheelEvent::Vertical(2), 0);
+        handle.send_wheel(WheelEvent::Horizontal(3), 0);
+        entered.recv().unwrap();
+        handle.set_paused(true);
+        release.send(()).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        handle.set_paused(false);
+        sender.close();
+        assert_eq!(
+            *packets.lock().unwrap(),
+            vec![SendPacket::Wheel {
+                axis: ScrollAxis::Vertical,
+                delta: 1,
+            }]
+        );
+
+        // The scroll mode ended (a new generation) while its wheel events are queued: neither
+        let (mut sender, packets, entered, release) = start_held();
+        let handle = sender.handle();
+        handle.send_wheel(WheelEvent::Vertical(1), 0); // held in the sink
+        handle.send_wheel(WheelEvent::Vertical(2), 0);
+        entered.recv().unwrap();
+        handle.set_generation(1);
+        handle.send_wheel(WheelEvent::Vertical(3), 1);
+        release.send(()).unwrap();
+        sender.close();
+        assert_eq!(
+            *packets.lock().unwrap(),
+            vec![
+                SendPacket::Wheel {
+                    axis: ScrollAxis::Vertical,
+                    delta: 1,
+                },
+                SendPacket::Wheel {
+                    axis: ScrollAxis::Vertical,
+                    delta: 3,
+                },
+            ]
+        );
+    }
+
     #[test]
     fn sender_drops_stale_or_paused_wheel_and_flushes_click_on_close() {
         let (sink, packets, _) = make_sink();
@@ -712,12 +808,14 @@ mod tests {
         let handle = sender.handle();
         let tags = ResendTags::next_unique();
 
-        handle.send_wheel(WheelEvent::Vertical(120), 0);
         handle.set_generation(1);
         handle.send_wheel(WheelEvent::Vertical(-120), 0);
         handle.send_wheel(WheelEvent::Horizontal(60), 1);
+        // Sent before Pause is turned on
+        thread::sleep(Duration::from_millis(30));
         handle.set_paused(true);
         handle.send_wheel(WheelEvent::Vertical(240), 1);
+        thread::sleep(Duration::from_millis(30));
         handle.set_paused(false);
         handle.send_click(
             MouseButton::Right,
@@ -731,10 +829,6 @@ mod tests {
         assert_eq!(
             *sent,
             vec![
-                SendPacket::Wheel {
-                    axis: ScrollAxis::Vertical,
-                    delta: 120,
-                },
                 SendPacket::Wheel {
                     axis: ScrollAxis::Horizontal,
                     delta: 60,

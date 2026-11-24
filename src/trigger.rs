@@ -289,6 +289,9 @@ struct LrWait {
     button: MouseButton,
     point: Point,
     press_id: u32,
+    // The time of the waiting down (of the hook): an event later than pollTimeout after it is not
+    // its pair, whether WM_TIMER has come yet or not (see expire_lr_wait_if_due)
+    time: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -410,6 +413,9 @@ impl TriggerEngine {
         if self.paused {
             return true;
         }
+        if !event.injected {
+            self.expire_lr_wait_if_due(event.time, host);
+        }
         if let Some(wait) = self.lr_wait {
             if !event.injected && event.point != wait.point {
                 self.lr_wait = None;
@@ -461,6 +467,9 @@ impl TriggerEngine {
                 None => true,
             };
         }
+
+        // Before this event, as the timer would have been: it comes after the wait has timed out
+        self.expire_lr_wait_if_due(event.time, host);
 
         self.tracker.on_before_physical(btn, is_down);
 
@@ -598,6 +607,7 @@ impl TriggerEngine {
                     button: btn,
                     point,
                     press_id,
+                    time,
                 });
                 host.set_poll_timer(self.config.trigger.poll_timeout_ms);
                 return false;
@@ -668,6 +678,15 @@ impl TriggerEngine {
         time: u32,
         host: &mut impl TriggerHost,
     ) -> bool {
+        // The up of a down resent alone (its wait timed out) while the other button waits: it is
+        // released as such (finish_physical_mouse), and the wait of the other button goes on, as
+        // .NET does (lrUp: checkResentDown before offerEventWaiter)
+        if self.last_flags.resent_down[btn.index()]
+            && self.lr_wait.is_some_and(|wait| wait.button != btn)
+        {
+            self.last_mouse_event = Some((btn, false));
+            return true;
+        }
         if let Some(wait) = self.lr_wait {
             if btn == wait.button {
                 self.lr_wait = None;
@@ -903,6 +922,21 @@ impl TriggerEngine {
                 }
 
                 true
+            }
+        }
+    }
+
+    /// The LR trigger wait has timed out by the time of this event (later than pollTimeout after
+    /// the waiting down): handled as its timeout, before the event. WM_TIMER is only made when the
+    /// queue of the thread has nothing else (the hook events come first), so it can come late: a
+    /// second down 80 ms after the first would still start scroll mode with a pollTimeout of 50 ms.
+    /// The .NET version waits on a thread of its own with the timeout, so an event after it is
+    /// not offered to the wait either (EventWaiter).
+    fn expire_lr_wait_if_due(&mut self, time: u32, host: &mut impl TriggerHost) {
+        if let Some(wait) = self.lr_wait {
+            let elapsed = time.wrapping_sub(wait.time) as i32;
+            if elapsed > self.config.trigger.poll_timeout_ms as i32 {
+                self.on_poll_timeout(host);
             }
         }
     }
@@ -1770,6 +1804,69 @@ mod tests {
             assert_eq!(kb.handle_key(key(vk, action, time), &mut host), HookDecision::Pass);
         }
         assert!(!kb.is_scrolling());
+    }
+
+    #[test]
+    fn lr_second_down_after_poll_timeout_is_not_a_pair_even_if_the_timer_is_late() {
+        let mut cfg = Config::default();
+        cfg.first_trigger = Trigger::Lr;
+        cfg.poll_timeout = 50;
+        let tags = ResendTags::next_unique();
+        let mut engine = TriggerEngine::new(
+            EngineConfig::from_config(&cfg, &CustomTableState::default()),
+            tags,
+        );
+        let mut host = MockHost::new();
+
+        // 80 ms apart, WM_TIMER not handled yet: the wait timed out first (its down resent),
+        // no scroll mode; the right down starts a wait of its own
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 5, 5, 1000), &mut host);
+        host.take_calls();
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Right), 5, 5, 1080), &mut host),
+            HookDecision::Suppress
+        );
+        assert!(!engine.is_scrolling());
+        assert_eq!(
+            host.take_calls(),
+            vec![
+                HostCall::KillTimer,
+                HostCall::Down(MouseButton::Left, Point { x: 5, y: 5 }, tags.encode(KIND_DOWN, 1)),
+                HostCall::SetTimer(50),
+            ]
+        );
+        // The left up is released as that of a resent down
+        engine.handle_mouse(
+            inj_mouse(HookMouseKind::Down(MouseButton::Left), 5, 5, 1081, tags.encode(KIND_DOWN, 1)),
+            &mut host,
+        );
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Left), 5, 5, 1090), &mut host),
+            HookDecision::Pass
+        );
+        // ... and the wait of the right down goes on: the left pressed again within its
+        // pollTimeout is its pair
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 5, 5, 1100), &mut host),
+            HookDecision::Suppress
+        );
+        assert!(engine.is_scrolling());
+
+        // A move after the timeout also resends the waiting down (as a timeout), and passes
+        engine.init_state(&mut host);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 5, 5, 2000), &mut host);
+        host.take_calls();
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Move, 9, 9, 2060), &mut host),
+            HookDecision::Pass
+        );
+        assert!(host.take_calls().iter().any(|c| matches!(c, HostCall::Down(MouseButton::Left, ..))));
+
+        // Within pollTimeout it is still a pair
+        engine.init_state(&mut host);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 5, 5, 3000), &mut host);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Right), 5, 5, 3050), &mut host);
+        assert!(engine.is_scrolling());
     }
 
     #[test]
