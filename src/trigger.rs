@@ -842,6 +842,18 @@ impl TriggerEngine {
                 if self.key_flags.kd_passed[vk] {
                     return true;
                 }
+                // Already down in the system: in the hook, GetAsyncKeyState still tells the state
+                // from before this event, so this is a repeat of a press whose down reached the
+                // application with no record of it here. E.g. passed just before an InputLost
+                // sent earlier (at an unlock or a resume) was handled: the hook's events are
+                // handled before the posted messages, and the reset forgot it. It passes as that
+                // press did, its up too: taken as a new press, it would start a scroll (or end
+                // one) and be suppressed, its up too, the key left pressed in the application.
+                // Not Pause, which does not repeat: its down is always a new press.
+                if event.vk_code != VK_PAUSE && host.is_key_down(event.vk_code) {
+                    self.key_flags.kd_passed[vk] = true;
+                    return true;
+                }
 
                 self.key_flags.kd_lone_up[vk] = false;
                 if is_trigger_key {
@@ -1069,7 +1081,8 @@ impl TriggerEngine {
     /// The session was locked or unlocked, or the system suspended or resumed: the hooks saw none
     /// of the input meanwhile (it went to the secure desktop, or was lost). As init_state, and the
     /// records of all keys and buttons are forgotten as when the hooks were lost: none is still
-    /// held from before.
+    /// held from before. Handled after the hook's events that came after it was sent: a key
+    /// passed then and forgotten passes on (see handle_key_inner, a repeat of a key down already).
     pub fn on_input_lost(&mut self, host: &mut impl TriggerHost) {
         self.init_state(host);
         self.tracker.forget_presses();
@@ -2201,6 +2214,55 @@ mod tests {
             engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Right), 10, 10, 800), &mut host),
             HookDecision::Pass
         );
+    }
+
+    #[test]
+    fn input_lost_after_a_passed_press_keeps_passing_it() {
+        use crate::exclusions::ExclusionList;
+
+        // After the unlock, the trigger key passed over an excluded window before the reset sent
+        // at the unlock was handled (the hook's events come first): its repeats and its up pass,
+        // no scroll starts. The next press is the trigger.
+        let excluded_pt = Point { x: 100, y: 100 };
+        let mut cfg = Config::default();
+        cfg.keyboard_hook = true;
+        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let matcher = ExclusionList::from_lines(["C:\\Games\\game.exe"]).to_matcher();
+        let mut kb = TriggerEngine::new(
+            EngineConfig::from_config(&cfg, &CustomTableState::default()).with_exclusions(matcher),
+            ResendTags::next_unique(),
+        );
+        let mut host = MockHost::new();
+        host.excluded_points.push(excluded_pt);
+        let vk = TriggerKey::VkLmenu.vk_code();
+        host.cursor = excluded_pt;
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 10), &mut host), HookDecision::Pass);
+        host.keys_down.push(vk);
+        kb.on_input_lost(&mut host);
+        host.cursor = Point { x: 20, y: 20 };
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 500), &mut host), HookDecision::Pass);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 530), &mut host), HookDecision::Pass);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 600), &mut host), HookDecision::Pass);
+        host.keys_down.clear();
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 700), &mut host), HookDecision::Suppress);
+        assert!(kb.is_scrolling());
+        kb.handle_key(key(vk, KeyAction::Up, 800), &mut host);
+
+        // Another key passed before the reset was handled, then a released scroll: the key's
+        // repeat does not end the scroll, and is not suppressed (its up would be too).
+        kb.init_state(&mut host);
+        let k = 0x41;
+        assert_eq!(kb.handle_key(key(k, KeyAction::Down, 900), &mut host), HookDecision::Pass);
+        host.keys_down.push(k);
+        kb.on_input_lost(&mut host);
+        kb.handle_key(key(vk, KeyAction::Down, 1000), &mut host);
+        kb.handle_key(key(vk, KeyAction::Up, 1050), &mut host);
+        assert!(kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(k, KeyAction::Down, 1100), &mut host), HookDecision::Pass);
+        assert!(kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(k, KeyAction::Up, 1200), &mut host), HookDecision::Pass);
     }
 
     #[test]
