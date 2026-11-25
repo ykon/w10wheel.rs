@@ -1,0 +1,121 @@
+name: Build
+
+# - push / pull request: test, build and upload the zip and its SHA-256 as workflow artifacts
+#   (W10Wheel.rs-<version>.zip, W10Wheel.rs-<version>.zip.sha256)
+# - tag v* (e.g. v2.10.0): additionally create a draft GitHub Release with both files, its notes
+#   from dist/release-notes/<tag>.md (reviewed and published on GitHub)
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # The MSVC target; rc.exe (build.rs) is in the Windows SDK of the runner
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build and package
+        id: package
+        shell: pwsh
+        run: ./build/package.ps1
+
+      - name: Check that the tag matches the version of Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          if ($env:TAG -ne "v$env:VERSION") {
+            throw "Tag $env:TAG does not match the version $env:VERSION in Cargo.toml"
+          }
+
+      # archive: false uploads a file as is (otherwise it is wrapped in a zip). Each artifact is
+      # named after its file
+      - uses: actions/upload-artifact@v7
+        with:
+          path: artifacts/W10Wheel.rs-${{ steps.package.outputs.version }}.zip
+          archive: false
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          path: artifacts/W10Wheel.rs-${{ steps.package.outputs.version }}.zip.sha256
+          archive: false
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      # skip-decompress: keep the zip as a file (by default a downloaded .zip is extracted)
+      - uses: actions/download-artifact@v8
+        with:
+          name: W10Wheel.rs-${{ needs.build.outputs.version }}.zip
+          path: artifacts
+          skip-decompress: true
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: W10Wheel.rs-${{ needs.build.outputs.version }}.zip.sha256
+          path: artifacts
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          find_file() {
+            local file
+            file=$(find artifacts -maxdepth 3 -type f -name "$1" -print -quit)
+            if [ -z "$file" ]; then
+              echo "$1 not found. Files downloaded:" >&2
+              find artifacts -maxdepth 3 -type f >&2
+              exit 1
+            fi
+            echo "$file"
+          }
+          zip=$(find_file "W10Wheel.rs-${VERSION}.zip") || exit 1
+          sha=$(find_file "W10Wheel.rs-${VERSION}.zip.sha256") || exit 1
+          # The hash was made by the build job: check that the zip is still that one
+          expected=$(cut -d' ' -f1 "$sha")
+          actual=$(sha256sum "$zip" | cut -d' ' -f1)
+          if [ "$expected" != "$actual" ]; then
+            echo "SHA-256 mismatch: $sha has $expected, the zip is $actual" >&2
+            exit 1
+          fi
+          # The release notes written for this version, else the history line of the Readme
+          notes_file="dist/release-notes/${TAG}.md"
+          if [ -f "$notes_file" ]; then
+            notes_args=(--notes-file "$notes_file")
+          else
+            notes=$(grep -m1 -F ": v${VERSION}:" dist/Readme.ja.txt | tr -d '\r' | sed 's/^[[:space:]]*//' || true)
+            notes_args=(--notes "${notes:-W10Wheel.rs v${VERSION}}")
+          fi
+          gh release create "$TAG" "$zip" "$sha" \
+            --draft \
+            --verify-tag \
+            --title "${VERSION}" \
+            "${notes_args[@]}"
