@@ -1755,16 +1755,37 @@ mod tests {
         assert_eq!(wide(&format!(r"\\?\C:\{long}")), format!("\\\\?\\C:\\{long}\0"));
     }
 
-    /// The path as usually written: `\\?\C:\…` as `C:\…`, `\\?\UNC\server\…` as `\\server\…`
-    fn plain_path(path: &Path) -> PathBuf {
-        let s = path.to_str().unwrap();
-        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-            PathBuf::from(format!(r"\\{rest}"))
-        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-            PathBuf::from(rest)
-        } else {
-            path.to_path_buf()
+    /// The path as usually written, if it is a drive or a UNC path (with whether it is a drive
+    /// path): `\\?\C:\…` as `C:\…`, `\\?\UNC\server\…` as `\\server\…`. None for any other, e.g.
+    /// a volume GUID path (`\\?\Volume{…}\…`): with its prefix removed, it would be relative.
+    fn plain_path(path: &Path) -> Option<(PathBuf, bool)> {
+        use std::path::{Component, Prefix};
+        let s = path.to_str()?;
+        let Some(Component::Prefix(prefix)) = path.components().next() else {
+            return None;
+        };
+        match prefix.kind() {
+            Prefix::Disk(_) => Some((path.to_path_buf(), true)),
+            Prefix::UNC(..) => Some((path.to_path_buf(), false)),
+            Prefix::VerbatimDisk(_) => Some((PathBuf::from(s.strip_prefix(r"\\?\")?), true)),
+            Prefix::VerbatimUNC(..) => {
+                let rest = s.strip_prefix(r"\\?\UNC\")?;
+                Some((PathBuf::from(format!(r"\\{rest}")), false))
+            }
+            _ => None,
         }
+    }
+
+    #[test]
+    fn plain_path_converts_drive_and_unc_paths_only() {
+        let plain = |p: &str| plain_path(Path::new(p)).map(|(p, d)| (p.display().to_string(), d));
+        assert_eq!(plain(r"C:\t\a"), Some((r"C:\t\a".into(), true)));
+        assert_eq!(plain(r"\\?\C:\t\a"), Some((r"C:\t\a".into(), true)));
+        assert_eq!(plain(r"\\s\sh\a"), Some((r"\\s\sh\a".into(), false)));
+        assert_eq!(plain(r"\\?\UNC\s\sh\a"), Some((r"\\s\sh\a".into(), false)));
+        let volume = r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\t\a";
+        assert_eq!(plain(volume), None);
+        assert_eq!(plain(r"\\.\C:\t\a"), None);
     }
 
     #[test]
@@ -1788,9 +1809,12 @@ mod tests {
         // The same file as a device path (`\\.\`), and through `..` (long, short once
         // normalized): replaced, not left to the direct write. Built from the directory as
         // usually written: TMP may be verbatim (`\\?\`), before which `\\.\` cannot be put and
-        // where `..` is not resolved.
-        let plain = plain_path(&dir.0);
-        if plain.to_str().and_then(|s| s.get(1..3)) == Some(":\\") {
+        // where `..` is not resolved. Only for a drive or a UNC path: another (e.g. a volume GUID
+        // path) has no such form, and the `\\.\` one only for a drive path.
+        let Some((plain, drive)) = plain_path(&dir.0) else {
+            return Ok(());
+        };
+        if drive {
             // As a string: join would replace `\\.\` by the absolute path
             let device = PathBuf::from(format!(
                 r"\\.\{}",
