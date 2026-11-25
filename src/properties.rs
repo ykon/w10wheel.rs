@@ -125,33 +125,40 @@ const REPLACEFILE_IGNORE_MERGE_ERRORS: u32 = 0x0000_0002;
 /// its own calls (MAX_PATH less the 12 units that a directory must leave for a 8.3 file name)
 const LEGACY_MAX_PATH: usize = 248;
 
-/// The path for a Win32 function called directly (std's own functions do this themselves): a
-/// long one is made absolute and given the `\\?\` prefix (`\\?\UNC\` for a share), as .NET does
-/// (File.Replace). Without it, such a function fails for a long path (ERROR_PATH_NOT_FOUND)
-/// unless long paths are enabled for both the system and the process. A short one is passed as
-/// it is.
+/// The path for a Win32 function called directly (std's own functions do this themselves): one
+/// that is long once made absolute (a relative one with the current directory) is given the
+/// `\\?\` prefix (`\\?\UNC\` for a share), as std and .NET (File.Replace) do. Without it, such a
+/// function fails for a long path (ERROR_PATH_NOT_FOUND) unless long paths are enabled for both
+/// the system and the process. Any other is passed as it is: a short one, one already verbatim
+/// or a device path (`\\.\`), and one that cannot be made absolute (not normalized, `\\?\` would
+/// take it literally).
 fn wide_path(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     const SEP: u16 = b'\\' as u16;
     const QUESTION: u16 = b'?' as u16;
     const DOT: u16 = b'.' as u16;
     const COLON: u16 = b':' as u16;
-    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-    if wide.len() >= LEGACY_MAX_PATH {
+    let encode = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().collect() };
+    let prefixed = |prefix: &str, rest: &[u16]| -> Vec<u16> {
+        prefix.encode_utf16().chain(rest.iter().copied()).collect()
+    };
+    let mut wide = encode(path);
+    let verbatim_or_device = matches!(wide.as_slice(), [SEP, SEP, QUESTION | DOT, SEP, ..]);
+    if !verbatim_or_device
+        && (wide.len() >= LEGACY_MAX_PATH || !path.is_absolute())
         // Normalized as Windows would (GetFullPathNameW): `\\?\` turns that off
-        if let Ok(absolute) = std::path::absolute(path) {
-            wide = absolute.as_os_str().encode_wide().collect();
+        && let Ok(absolute) = std::path::absolute(path)
+    {
+        let full = encode(&absolute);
+        if full.len() >= LEGACY_MAX_PATH {
+            match full.as_slice() {
+                // A device (e.g. a name such as COM1 made `\\.\COM1`): as it was
+                [SEP, SEP, QUESTION | DOT, SEP, ..] => {}
+                [SEP, SEP, rest @ ..] => wide = prefixed(r"\\?\UNC\", rest),
+                [_, COLON, SEP, ..] => wide = prefixed(r"\\?\", &full),
+                _ => {}
+            }
         }
-        let prefixed = |prefix: &str, rest: &[u16]| -> Vec<u16> {
-            prefix.encode_utf16().chain(rest.iter().copied()).collect()
-        };
-        wide = match wide.as_slice() {
-            // Already verbatim, or a device path (`\\.\`)
-            [SEP, SEP, QUESTION | DOT, SEP, ..] => wide,
-            [SEP, SEP, rest @ ..] => prefixed(r"\\?\UNC\", rest),
-            [_, COLON, SEP, ..] => prefixed(r"\\?\", &wide),
-            _ => wide,
-        };
     }
     wide.push(0);
     wide
@@ -1664,6 +1671,14 @@ mod tests {
             format!("\\\\?\\UNC\\server\\share\\{long}\0")
         );
         assert_eq!(wide(&format!(r"\\?\C:\{long}")), format!("\\\\?\\C:\\{long}\0"));
+        // Relative: long with the current directory only
+        let cwd = std::env::current_dir().unwrap();
+        let cwd = cwd.to_str().unwrap();
+        assert_eq!(&cwd[1..3], ":\\");
+        let rel = "r".repeat(LEGACY_MAX_PATH.saturating_sub(cwd.len()).max(1));
+        assert!(rel.len() < LEGACY_MAX_PATH);
+        assert_eq!(wide(&rel), format!("\\\\?\\{cwd}\\{rel}\0"));
+        assert_eq!(wide("short.properties"), "short.properties\0");
     }
 
     #[test]
