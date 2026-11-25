@@ -477,25 +477,23 @@ unsafe extern "system" fn tray_wnd_proc(
         }
         WM_POWERBROADCAST if wparam == PBT_APMSUSPEND => {
             state.resume_seen = false;
-            state.suspend_reset = reset_input_at_loss(hwnd, state);
+            state.suspend_reset = reset_input_at_loss(hwnd, state, true);
         }
         WM_POWERBROADCAST
             if wparam == PBT_APMRESUMEAUTOMATIC || wparam == PBT_APMRESUMESUSPEND =>
         {
             let automatic = wparam == PBT_APMRESUMEAUTOMATIC;
-            if resume_resets_input(&mut state.resume_seen, &mut state.suspend_reset, automatic) {
-                on_input_lost(hwnd, state);
-            }
+            let reset = resume_resets_input(&mut state.resume_seen, &mut state.suspend_reset, automatic);
+            on_input_back(hwnd, state, reset);
             schedule_reinstall_hooks(hwnd, state);
         }
         WM_WTSSESSION_CHANGE if wparam == WTS_SESSION_LOCK => {
-            state.lock_reset = reset_input_at_loss(hwnd, state);
+            state.lock_reset = reset_input_at_loss(hwnd, state, false);
         }
         WM_WTSSESSION_CHANGE if wparam == WTS_SESSION_UNLOCK => {
             // The lock missed (not notified, or its reset not done in time): reset now
-            if !std::mem::take(&mut state.lock_reset) {
-                on_input_lost(hwnd, state);
-            }
+            let reset = !std::mem::take(&mut state.lock_reset);
+            on_input_back(hwnd, state, reset);
             schedule_reinstall_hooks(hwnd, state);
         }
         IPC_COMMAND_MESSAGE => {
@@ -624,30 +622,36 @@ fn init_state(hwnd: Handle, state: &mut TrayHostState) {
     state.cursor.set_axis(&hw, None);
 }
 
-/// The session was locked, or the system suspended: the hooks see nothing of the input until the
-/// unlock or the resume (it goes to the secure desktop, or is lost), so a trigger released then
-/// would keep its scroll mode (the moves suppressed), and a key or button released then would keep
-/// its records. A scroll is ended and all the records are reset (TriggerEngine::on_input_lost),
+/// The session was locked, or the system is to suspend: the hooks see nothing of the input until
+/// the unlock or the resume (it goes to the secure desktop, or is lost), so a trigger released
+/// then would keep its scroll mode (the moves suppressed), and a key or button released then would
+/// keep its records. A scroll is ended and all the records are reset (TriggerEngine::on_input_lost)
 /// before the input is lost: this waits for it to be done (the hook thread answers at once; the
 /// system waits for WM_POWERBROADCAST). Whether it was: then the unlock or the resume keeps the
-/// input (the hooks saw all of it since), and only installs the hooks again. Reset there, the
-/// input seen before the GUI handled the notification would be lost too (the hook's events are
-/// handled before the posted messages): a key pressed then would be taken as a new press at its
-/// repeat, and its scroll left on at its up, or its up suppressed.
-fn reset_input_at_loss(hwnd: Handle, state: &mut TrayHostState) -> bool {
-    let done = state.control.input_lost_and_wait(INPUT_RESET_WAIT);
+/// input, and only installs the hooks again. Reset there, the input seen before the GUI handled
+/// the notification would be lost too (the hook's events are handled before the posted messages):
+/// a key pressed then would be taken as a new press at its repeat, and its scroll left on at its
+/// up, or its up suppressed.
+/// A lock is notified once it is locked (WM_WTSSESSION_CHANGE), a suspend before the system sleeps
+/// (PBT_APMSUSPEND): the input until then is seen, its ups maybe not. After a suspend, all the
+/// input passes until the resume (`suspend`, see TriggerEngine::set_sleeping).
+fn reset_input_at_loss(hwnd: Handle, state: &mut TrayHostState, suspend: bool) -> bool {
+    let done = state.control.input_lost_and_wait(suspend, INPUT_RESET_WAIT);
     let hw = unsafe { w::HWND::from_ptr(hwnd) };
     state.cursor.set_axis(&hw, None);
     done
 }
 
-/// An unlock or a resume whose lock or suspend was missed (not notified, or its reset not done in
-/// time, see reset_input_at_loss): reset now. Done at the event, not when the hooks are installed
-/// again later (a scroll started after it goes on).
-fn on_input_lost(hwnd: Handle, state: &mut TrayHostState) {
-    let _ = state.control.input_lost();
-    let hw = unsafe { w::HWND::from_ptr(hwnd) };
-    state.cursor.set_axis(&hw, None);
+/// An unlock or a resume: the input is handled again after a suspend, and reset if the lock or
+/// the suspend was missed (`reset`: not notified, or its reset not done in time, see
+/// reset_input_at_loss). Done at the event, not when the hooks are installed again later (a
+/// scroll started after it goes on).
+fn on_input_back(hwnd: Handle, state: &mut TrayHostState, reset: bool) {
+    let _ = state.control.input_back(reset);
+    if reset {
+        let hw = unsafe { w::HWND::from_ptr(hwnd) };
+        state.cursor.set_axis(&hw, None);
+    }
 }
 
 /// A resume is notified once or twice: PBT_APMRESUMEAUTOMATIC first, always, and

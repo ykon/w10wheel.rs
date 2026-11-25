@@ -238,11 +238,21 @@ impl HookApp {
                             self.sync_keyboard_hook(&mut hooks.keyboard, true);
                         }
                         Command::ReinstallHooks => self.reinstall_hooks(hooks),
-                        Command::InputLost(done) => {
-                            self.engine.on_input_lost(&mut self.host);
-                            if let Some(done) = done {
-                                let _ = done.send(());
+                        // Done only if the GUI still waits (a rendezvous: then it knows): after
+                        // its wait expired, it resets at the end instead (see input_lost_and_wait)
+                        Command::InputLost { done, suspend } => {
+                            if done.send(()).is_ok() {
+                                self.engine.on_input_lost(&mut self.host);
+                                if suspend {
+                                    self.engine.set_sleeping(true);
+                                }
                             }
+                        }
+                        Command::InputBack(reset) => {
+                            if reset {
+                                self.engine.on_input_lost(&mut self.host);
+                            }
+                            self.engine.set_sleeping(false);
                         }
                         Command::Stop => win32::quit(),
                         Command::WatchScroll(window) => {
@@ -285,7 +295,8 @@ impl HookApp {
     /// was none, and a failure is reported as at a load (the setting turned off, not stored).
     /// Only a hook that Windows had removed already has its records reset (events may have been
     /// missed); the input missed while the session was locked or the system asleep is reset by
-    /// the InputLost sent at the lock or the suspend (see app.rs, reset_input_at_loss).
+    /// the InputLost sent at the lock or the suspend (see app.rs, reset_input_at_loss), or by the
+    /// InputBack at the unlock or the resume if that was missed.
     fn reinstall_hooks(&mut self, hooks: &mut win32::Hooks) {
         if let Ok(true) = hooks.reinstall_mouse() {
             self.engine.on_mouse_hook_lost(&mut self.host);
@@ -493,18 +504,21 @@ impl EngineControl {
         self.send(Command::ReinstallHooks)
     }
 
-    /// The input was not seen (an unlock or a resume whose start was missed): a scroll is ended
-    /// and the records of all keys and buttons are reset
-    pub fn input_lost(&self) -> io::Result<()> {
-        self.send(Command::InputLost(None))
+    /// The input will not be seen (a lock or a suspend): a scroll is ended and the records of all
+    /// keys and buttons are reset, waiting up to `timeout` for it to be done. After a suspend, all
+    /// the input passes until input_back (TriggerEngine::set_sleeping). Whether it was done: then
+    /// the unlock or the resume keeps the input. If not, it is not done later either (a channel
+    /// of no capacity: the hook thread hands its answer to the GUI waiting, or sees it gone): it
+    /// is done at the unlock or the resume, once.
+    pub fn input_lost_and_wait(&self, suspend: bool, timeout: Duration) -> bool {
+        let (done, wait) = mpsc::sync_channel(0);
+        self.send(Command::InputLost { done, suspend }).is_ok() && wait.recv_timeout(timeout).is_ok()
     }
 
-    /// The input will not be seen (a lock or a suspend): as input_lost, waiting up to `timeout` for
-    /// it to be done. Whether it was: then the input seen after it is seen, not lost, and the
-    /// unlock or the resume keeps it.
-    pub fn input_lost_and_wait(&self, timeout: Duration) -> bool {
-        let (done, wait) = mpsc::sync_channel(1);
-        self.send(Command::InputLost(Some(done))).is_ok() && wait.recv_timeout(timeout).is_ok()
+    /// The input is seen again (an unlock or a resume): reset as at input_lost_and_wait if that
+    /// was not done (`reset`), and handled again after a suspend
+    pub fn input_back(&self, reset: bool) -> io::Result<()> {
+        self.send(Command::InputBack(reset))
     }
 
     pub fn watch_scroll(&self, window: usize) -> io::Result<()> {
