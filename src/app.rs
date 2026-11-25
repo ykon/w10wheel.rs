@@ -635,7 +635,7 @@ fn handle_keyboard_hook_failed(state: &mut TrayHostState, wparam: usize, lparam:
         (s.store.config().ui_language, s.dark)
     };
     if let Some(ref mut settings) = state.settings {
-        settings.refresh();
+        settings.refresh_values();
     }
     let owner = state
         .settings
@@ -661,7 +661,7 @@ fn set_paused(hwnd: Handle, state: &mut TrayHostState, paused: bool) {
     state.cursor.set_axis(&hw, None);
     let _ = sync_tray(hwnd, state);
     if let Some(ref mut settings) = state.settings {
-        settings.refresh();
+        settings.refresh_values();
     }
 }
 
