@@ -656,6 +656,13 @@ impl MouseHook {
         }
         Ok(Self(hook))
     }
+
+    /// Unhooks it: false if Windows had removed it already
+    fn remove(self) -> bool {
+        let removed = unsafe { UnhookWindowsHookEx(self.0) } != 0;
+        std::mem::forget(self);
+        removed
+    }
 }
 
 impl Drop for MouseHook {
@@ -755,9 +762,11 @@ impl Hooks {
     /// resume and then sees the buttons first, and passes on only the ones it injects). The new
     /// hook is installed before the old one is removed (kept if that fails); no event is handled
     /// in between, as the hooks are called on this thread only when it takes its messages.
-    pub(crate) fn reinstall_mouse(&mut self) -> io::Result<()> {
-        self.mouse = MouseHook::install()?;
-        Ok(())
+    /// Ok(true): Windows had removed the old one already (e.g. for a timeout; its
+    /// UnhookWindowsHookEx failed), so events may have been missed before.
+    pub(crate) fn reinstall_mouse(&mut self) -> io::Result<bool> {
+        let old = std::mem::replace(&mut self.mouse, MouseHook::install()?);
+        Ok(!old.remove())
     }
 }
 

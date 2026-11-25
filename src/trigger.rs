@@ -1002,6 +1002,22 @@ impl TriggerEngine {
     /// (KEventHandler.hookInstalled), the suppressed keys are forgotten, and the scroll mode the
     /// trigger key started (which would not end) is ended. A hook replaced while the old one was
     /// still installed missed nothing: nothing is changed then (a scroll in progress goes on).
+    /// The mouse hook has been replaced, and Windows had removed the old one (e.g. for a
+    /// timeout): buttons may have been released with no hook to see it, and a scroll mode they
+    /// started would not end (the moves suppressed). The mouse triggers' records are reset and
+    /// that scroll mode is ended (a keyboard one goes on). A hook replaced while the old one was
+    /// still installed missed nothing: nothing is changed then.
+    pub fn on_mouse_hook_lost(&mut self, host: &mut impl TriggerHost) {
+        if self.lr_wait.take().is_some() {
+            host.kill_poll_timer();
+        }
+        if self.is_mouse_scroll() {
+            self.exit_scroll(host);
+        }
+        self.last_flags.reset();
+        self.last_mouse_event = None;
+    }
+
     pub fn on_keyboard_hook_lost(&mut self, host: &mut impl TriggerHost) {
         self.key_flags.forget_suppressed();
         if self.is_keyboard_scroll() {
@@ -1929,6 +1945,36 @@ mod tests {
         engine.set_paused(true, &mut host);
         engine.set_paused(false, &mut host);
         assert!(!engine.keyboard_hook_enabled());
+    }
+
+    #[test]
+    fn lost_mouse_hook_ends_mouse_scroll_only() {
+        // A drag scroll whose up was missed (the old hook removed by Windows): ended, and the
+        // trigger works again.
+        let (mut engine, _tags, mut host) = base_engine(Trigger::RightDrag);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Right), 10, 10, 100), &mut host);
+        assert!(engine.is_scrolling());
+        engine.on_mouse_hook_lost(&mut host);
+        assert!(!engine.is_scrolling());
+        assert!(host.take_calls().contains(&HostCall::StopRaw));
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Right), 10, 10, 900), &mut host),
+            HookDecision::Suppress
+        );
+        assert!(engine.is_scrolling());
+
+        // A keyboard scroll goes on.
+        let mut cfg = Config::default();
+        cfg.keyboard_hook = true;
+        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let mut kb = TriggerEngine::new(
+            EngineConfig::from_config(&cfg, &CustomTableState::default()),
+            ResendTags::next_unique(),
+        );
+        kb.handle_key(key(TriggerKey::VkLmenu.vk_code(), KeyAction::Down, 10), &mut host);
+        assert!(kb.is_scrolling());
+        kb.on_mouse_hook_lost(&mut host);
+        assert!(kb.is_scrolling());
     }
 
     #[test]

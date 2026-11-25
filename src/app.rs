@@ -44,10 +44,18 @@ const EXIT_RETRY_MS: u32 = 50;
 const REINSTALL_HOOKS_TIMER: usize = 4;
 const REINSTALL_HOOKS_DELAYS_MS: [u32; 2] = [2_000, 8_000];
 
+// The registration for the lock and unlock, retried if it failed (see
+// register_session_notification)
+const SESSION_NOTIFICATION_RETRY_TIMER: usize = 5;
+const SESSION_NOTIFICATION_RETRY_MS: u32 = 10_000;
+const SESSION_NOTIFICATION_RETRIES: u32 = 3;
+
 const WM_POWERBROADCAST: u32 = 0x0218;
+const PBT_APMSUSPEND: usize = 0x0004;
 const PBT_APMRESUMESUSPEND: usize = 0x0007;
 const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
 const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+const WTS_SESSION_LOCK: usize = 0x7;
 const WTS_SESSION_UNLOCK: usize = 0x8;
 const NOTIFY_FOR_THIS_SESSION: u32 = 0;
 const DEVICE_NOTIFY_WINDOW_HANDLE: u32 = 0;
@@ -122,6 +130,7 @@ struct TrayHostState {
     // once (cleanup_tray_resources runs at the exit and again at WM_DESTROY)
     suspend_resume_notification: Option<Handle>,
     session_notification: bool,
+    session_notification_retries: u32,
 }
 
 pub(crate) fn main() -> ExitCode {
@@ -345,6 +354,7 @@ fn run(options: LaunchOptions) -> ExitCode {
         reinstall_hooks_step: 0,
         suspend_resume_notification: None,
         session_notification: false,
+        session_notification_retries: 0,
     });
 
     if let Err(err) = sync_tray(tray_host, &mut host_state) {
@@ -447,13 +457,25 @@ unsafe extern "system" fn tray_wnd_proc(
                 reinstall_hooks_on_timer(hwnd, state);
                 return 0;
             }
+            if wparam == SESSION_NOTIFICATION_RETRY_TIMER {
+                register_session_notification(hwnd, state);
+                return 0;
+            }
+        }
+        WM_POWERBROADCAST if wparam == PBT_APMSUSPEND => {
+            init_state(hwnd, state);
         }
         WM_POWERBROADCAST
             if wparam == PBT_APMRESUMEAUTOMATIC || wparam == PBT_APMRESUMESUSPEND =>
         {
+            init_state(hwnd, state);
             schedule_reinstall_hooks(hwnd, state);
         }
+        WM_WTSSESSION_CHANGE if wparam == WTS_SESSION_LOCK => {
+            init_state(hwnd, state);
+        }
         WM_WTSSESSION_CHANGE if wparam == WTS_SESSION_UNLOCK => {
+            init_state(hwnd, state);
             schedule_reinstall_hooks(hwnd, state);
         }
         IPC_COMMAND_MESSAGE => {
@@ -571,12 +593,19 @@ fn handle_ipc_command(hwnd: Handle, state: &mut TrayHostState, wparam: usize) {
             }
             let _ = sync_tray(hwnd, state);
         }
-        IpcCommand::SendInitState => {
-            let _ = state.control.init_state();
-            let hw = unsafe { w::HWND::from_ptr(hwnd) };
-            state.cursor.set_axis(&hw, None);
-        }
+        IpcCommand::SendInitState => init_state(hwnd, state),
     }
+}
+
+/// Ends a scroll and resets the triggers' records (as --sendInitState). Also when the session is
+/// locked or unlocked, or the system suspended or resumed: the hooks see nothing of the input
+/// meanwhile (it goes to the secure desktop, or is lost), so a trigger released then would keep
+/// its scroll mode (the moves suppressed). Done at the event, not when the hooks are installed
+/// again later (a scroll started after it goes on).
+fn init_state(hwnd: Handle, state: &mut TrayHostState) {
+    let _ = state.control.init_state();
+    let hw = unsafe { w::HWND::from_ptr(hwnd) };
+    state.cursor.set_axis(&hw, None);
 }
 
 /// The keyboard hook could not be installed (at startup, at a load, or turned on in the dialog): the
@@ -628,23 +657,32 @@ fn set_paused(hwnd: Handle, state: &mut TrayHostState, paused: bool) {
     }
 }
 
-/// After a resume or an unlock, the hooks are installed again, so that they are first in the
-/// chain again (the newest hook is called first). Mouse software can install its hook again then
-/// (e.g. X-Mouse Button Control). It is then called first, blocks the buttons it remaps and
-/// injects others, and W10Wheel ignores injected input: no mouse trigger works any more. The
-/// hooks are installed some time after the event, after the other software's, and once more later
-/// in case that software was late. Pausing and resuming does it at once (see HookApp::set_paused).
-/// The resume (WM_POWERBROADCAST) also with modern standby (S0 Low Power Idle), where it is sent
-/// only to the windows registered for it, and the unlock (WM_WTSSESSION_CHANGE). One that fails
-/// is left out: the other still installs the hooks again.
+/// The suspend and resume (WM_POWERBROADCAST) also with modern standby (S0 Low Power Idle), where
+/// they are sent only to the windows registered for them, and the lock and unlock
+/// (WM_WTSSESSION_CHANGE). If one cannot be registered, the other still works.
 fn register_resume_notifications(hwnd: Handle, state: &mut TrayHostState) {
     let notification = unsafe { RegisterSuspendResumeNotification(hwnd, DEVICE_NOTIFY_WINDOW_HANDLE) };
     state.suspend_resume_notification = (!notification.is_null()).then_some(notification);
-    state.session_notification =
-        unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } != 0;
+    register_session_notification(hwnd, state);
+}
+
+/// Started at the start of the session, WTSRegisterSessionNotification can fail until the
+/// services it needs have started (RPC_S_INVALID_BINDING): retried 3 times, 10 s apart. Started
+/// after the sign-in as usual, they have started already.
+fn register_session_notification(hwnd: Handle, state: &mut TrayHostState) {
+    if unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } != 0 {
+        state.session_notification = true;
+        kill_timer(hwnd, SESSION_NOTIFICATION_RETRY_TIMER);
+    } else if state.session_notification_retries < SESSION_NOTIFICATION_RETRIES {
+        state.session_notification_retries += 1;
+        set_timer(hwnd, SESSION_NOTIFICATION_RETRY_TIMER, SESSION_NOTIFICATION_RETRY_MS);
+    } else {
+        kill_timer(hwnd, SESSION_NOTIFICATION_RETRY_TIMER);
+    }
 }
 
 fn unregister_resume_notifications(hwnd: Handle, state: &mut TrayHostState) {
+    kill_timer(hwnd, SESSION_NOTIFICATION_RETRY_TIMER);
     if let Some(notification) = state.suspend_resume_notification.take() {
         unsafe { UnregisterSuspendResumeNotification(notification) };
     }
@@ -653,6 +691,12 @@ fn unregister_resume_notifications(hwnd: Handle, state: &mut TrayHostState) {
     }
 }
 
+/// After a resume or an unlock, the hooks are installed again, so that they are first in the
+/// chain again (the newest hook is called first). Mouse software can install its hook again then
+/// (e.g. X-Mouse Button Control). It is then called first, blocks the buttons it remaps and
+/// injects others, and W10Wheel ignores injected input: no mouse trigger works any more. The
+/// hooks are installed some time after the event, after the other software's, and once more later
+/// in case that software was late. Pausing and resuming does it at once (see HookApp::set_paused).
 fn schedule_reinstall_hooks(hwnd: Handle, state: &mut TrayHostState) {
     state.reinstall_hooks_step = 1;
     set_timer(hwnd, REINSTALL_HOOKS_TIMER, REINSTALL_HOOKS_DELAYS_MS[0]);

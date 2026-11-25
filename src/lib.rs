@@ -272,8 +272,13 @@ impl HookApp {
     /// goes on. If one cannot be installed now, the old one stays and nothing is reported. While
     /// paused, the keyboard hook stays removed; at the end of a pause it is installed where there
     /// was none, and a failure is reported as at a load (the setting turned off, not stored).
+    /// Only a hook that Windows had removed already has its records reset (events may have been
+    /// missed); the input missed while the session was locked or the system asleep is reset by
+    /// the InitState sent then (see app.rs, init_state).
     fn reinstall_hooks(&mut self, hooks: &mut win32::Hooks) {
-        let _ = hooks.reinstall_mouse();
+        if let Ok(true) = hooks.reinstall_mouse() {
+            self.engine.on_mouse_hook_lost(&mut self.host);
+        }
         self.sync_keyboard_hook(&mut hooks.keyboard, true);
     }
 
