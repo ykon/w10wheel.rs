@@ -268,9 +268,10 @@ impl HookApp {
     }
 
     /// Installs the hooks again, to be first in the chain again (the newest hook is called
-    /// first). If the mouse hook cannot be installed now, the old one stays. If the keyboard
-    /// hook cannot, it is reported as at a load (the setting is turned off but not stored).
-    /// While paused, the keyboard hook stays removed.
+    /// first). Each new hook is installed before the old one is removed: a scroll in progress
+    /// goes on. If one cannot be installed now, the old one stays and nothing is reported. While
+    /// paused, the keyboard hook stays removed; at the end of a pause it is installed where there
+    /// was none, and a failure is reported as at a load (the setting turned off, not stored).
     fn reinstall_hooks(&mut self, hooks: &mut win32::Hooks) {
         let _ = hooks.reinstall_mouse();
         self.sync_keyboard_hook(&mut hooks.keyboard, true);
@@ -279,17 +280,24 @@ impl HookApp {
     fn sync_keyboard_hook(&mut self, keyboard_hook: &mut Option<win32::KeyboardHook>, reinstall: bool) {
         let enabled = self.engine.keyboard_hook_enabled();
         match win32::KeyboardHook::sync(keyboard_hook, enabled, reinstall) {
-            win32::KeyboardHookSync::Unchanged => {}
-            win32::KeyboardHookSync::Installed { old_hook_lost } => {
-                self.engine
-                    .on_keyboard_hook_installed(old_hook_lost, &mut self.host);
+            // Installed where there was none: no records of keys are kept (reset when it was
+            // removed or could not be installed). Replaced seamlessly: they still hold.
+            win32::KeyboardHookSync::Unchanged
+            | win32::KeyboardHookSync::Installed
+            | win32::KeyboardHookSync::Replaced {
+                old_hook_lost: false,
+            } => {}
+            win32::KeyboardHookSync::Replaced {
+                old_hook_lost: true,
+            } => {
+                self.engine.on_keyboard_hook_lost(&mut self.host);
             }
             win32::KeyboardHookSync::Removed => {
                 self.engine.on_keyboard_hook_removed(&mut self.host);
             }
             win32::KeyboardHookSync::Failed(error_code) => {
-                // No hook now (the old one was removed): as when it is turned off. The GUI turns
-                // the setting off and says why (.NET: Ctx.setKeyboardHookOf).
+                // No hook (there was none): as when it is turned off. The GUI turns the setting
+                // off and says why (.NET: Ctx.setKeyboardHookOf).
                 self.engine.on_keyboard_hook_removed(&mut self.host);
                 self.host.report_keyboard_hook_failure(error_code, reinstall);
             }

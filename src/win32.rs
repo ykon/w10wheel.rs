@@ -669,13 +669,17 @@ pub(crate) struct KeyboardHook(Handle);
 /// What `KeyboardHook::sync` did
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum KeyboardHookSync {
+    /// Nothing changed, also when a replacement could not be installed (the old hook stays)
     Unchanged,
-    /// Installed (again). `old_hook_lost`: the hook it replaced had been removed by Windows
-    /// already (e.g. for a timeout): UnhookWindowsHookEx failed.
-    Installed { old_hook_lost: bool },
+    /// Installed where there was none
+    Installed,
+    /// Replaced by a new one, installed before the old one was removed: no event was missed.
+    /// `old_hook_lost`: Windows had removed the old one already (e.g. for a timeout; its
+    /// UnhookWindowsHookEx failed), so events may have been missed before.
+    Replaced { old_hook_lost: bool },
     /// Removed: no keyboard events are seen any more
     Removed,
-    /// Could not be installed (the Win32 error code): no hook any more
+    /// Could not be installed where there was none (the Win32 error code)
     Failed(i32),
 }
 
@@ -696,16 +700,23 @@ impl KeyboardHook {
     }
 
     /// Installs or removes the hook as `enabled` says. `reinstall`: an installed hook is replaced
-    /// by a new one (done on every load of the properties, which also recovers a hook that
-    /// Windows removed silently).
+    /// by a new one, first in the chain (on every load of the properties, after a resume or an
+    /// unlock: also recovers a hook that Windows removed silently). As the mouse hook
+    /// (Hooks::reinstall_mouse): the new one is installed before the old one is removed, with no
+    /// event handled in between, and the old one stays if that fails.
     pub(crate) fn sync(slot: &mut Option<Self>, enabled: bool, reinstall: bool) -> KeyboardHookSync {
-        let mut old_hook_lost = false;
-        let mut had_old = false;
-        if reinstall && let Some(old) = slot.take() {
-            had_old = true;
-            old_hook_lost = !old.remove();
-        }
         match (enabled, slot.take()) {
+            (true, Some(old)) if reinstall => match Self::install() {
+                Ok(hook) => {
+                    let old_hook_lost = !old.remove();
+                    *slot = Some(hook);
+                    KeyboardHookSync::Replaced { old_hook_lost }
+                }
+                Err(_) => {
+                    *slot = Some(old);
+                    KeyboardHookSync::Unchanged
+                }
+            },
             (true, Some(hook)) => {
                 *slot = Some(hook);
                 KeyboardHookSync::Unchanged
@@ -713,7 +724,7 @@ impl KeyboardHook {
             (true, None) => match Self::install() {
                 Ok(hook) => {
                     *slot = Some(hook);
-                    KeyboardHookSync::Installed { old_hook_lost }
+                    KeyboardHookSync::Installed
                 }
                 Err(err) => KeyboardHookSync::Failed(err.raw_os_error().unwrap_or(0)),
             },
@@ -721,7 +732,6 @@ impl KeyboardHook {
                 let _ = hook.remove();
                 KeyboardHookSync::Removed
             }
-            (false, None) if had_old => KeyboardHookSync::Removed,
             (false, None) => KeyboardHookSync::Unchanged,
         }
     }

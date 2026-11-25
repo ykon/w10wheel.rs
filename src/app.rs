@@ -50,6 +50,7 @@ const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
 const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
 const WTS_SESSION_UNLOCK: usize = 0x8;
 const NOTIFY_FOR_THIS_SESSION: u32 = 0;
+const DEVICE_NOTIFY_WINDOW_HANDLE: u32 = 0;
 
 const TRAY_CLASS: &str = "W10WheelTrayHost";
 const ICON_ID: u32 = 1;
@@ -93,6 +94,8 @@ unsafe extern "system" {
     fn SetMenuDefaultItem(hmenu: *mut c_void, item: u32, by_pos: u32) -> i32;
     fn CheckMenuItem(hmenu: *mut c_void, id_check_item: u32, check: u32) -> u32;
     fn LoadIconW(hinstance: Handle, name: usize) -> Handle;
+    fn RegisterSuspendResumeNotification(recipient: Handle, flags: u32) -> Handle;
+    fn UnregisterSuspendResumeNotification(handle: Handle) -> i32;
 }
 
 #[link(name = "wtsapi32")]
@@ -115,6 +118,10 @@ struct TrayHostState {
     exit_deferred: bool,
     // The next of REINSTALL_HOOKS_DELAYS_MS after the one running
     reinstall_hooks_step: usize,
+    // The registrations for a resume and an unlock (see register_resume_notifications), undone
+    // once (cleanup_tray_resources runs at the exit and again at WM_DESTROY)
+    suspend_resume_notification: Option<Handle>,
+    session_notification: bool,
 }
 
 pub(crate) fn main() -> ExitCode {
@@ -336,6 +343,8 @@ fn run(options: LaunchOptions) -> ExitCode {
         shutting_down: false,
         exit_deferred: false,
         reinstall_hooks_step: 0,
+        suspend_resume_notification: None,
+        session_notification: false,
     });
 
     if let Err(err) = sync_tray(tray_host, &mut host_state) {
@@ -358,8 +367,7 @@ fn run(options: LaunchOptions) -> ExitCode {
     }
 
     let _ = engine.control().watch_scroll(tray_host as usize);
-    // For WTS_SESSION_UNLOCK. Without it (fails), only a resume installs the hooks again.
-    unsafe { WTSRegisterSessionNotification(tray_host, NOTIFY_FOR_THIS_SESSION) };
+    register_resume_notifications(tray_host, &mut host_state);
 
     if options.open_settings
         && let Some(ref mut s) = host_state.settings
@@ -626,6 +634,25 @@ fn set_paused(hwnd: Handle, state: &mut TrayHostState, paused: bool) {
 /// injects others, and W10Wheel ignores injected input: no mouse trigger works any more. The
 /// hooks are installed some time after the event, after the other software's, and once more later
 /// in case that software was late. Pausing and resuming does it at once (see HookApp::set_paused).
+/// The resume (WM_POWERBROADCAST) also with modern standby (S0 Low Power Idle), where it is sent
+/// only to the windows registered for it, and the unlock (WM_WTSSESSION_CHANGE). One that fails
+/// is left out: the other still installs the hooks again.
+fn register_resume_notifications(hwnd: Handle, state: &mut TrayHostState) {
+    let notification = unsafe { RegisterSuspendResumeNotification(hwnd, DEVICE_NOTIFY_WINDOW_HANDLE) };
+    state.suspend_resume_notification = (!notification.is_null()).then_some(notification);
+    state.session_notification =
+        unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) } != 0;
+}
+
+fn unregister_resume_notifications(hwnd: Handle, state: &mut TrayHostState) {
+    if let Some(notification) = state.suspend_resume_notification.take() {
+        unsafe { UnregisterSuspendResumeNotification(notification) };
+    }
+    if std::mem::take(&mut state.session_notification) {
+        unsafe { WTSUnRegisterSessionNotification(hwnd) };
+    }
+}
+
 fn schedule_reinstall_hooks(hwnd: Handle, state: &mut TrayHostState) {
     state.reinstall_hooks_step = 1;
     set_timer(hwnd, REINSTALL_HOOKS_TIMER, REINSTALL_HOOKS_DELAYS_MS[0]);
@@ -645,7 +672,7 @@ fn reinstall_hooks_on_timer(hwnd: Handle, state: &mut TrayHostState) {
 fn cleanup_tray_resources(hwnd: Handle, state: &mut TrayHostState) {
     kill_timer(hwnd, RESTORE_TIMER);
     kill_timer(hwnd, REINSTALL_HOOKS_TIMER);
-    unsafe { WTSUnRegisterSessionNotification(hwnd) };
+    unregister_resume_notifications(hwnd, state);
     let _ = state.control.watch_scroll(0);
     let hw = unsafe { w::HWND::from_ptr(hwnd) };
     let _ = state.cursor.restore();

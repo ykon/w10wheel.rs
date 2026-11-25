@@ -997,17 +997,13 @@ impl TriggerEngine {
         self.last_mouse_event = None;
     }
 
-    /// The keyboard hook has been installed (again, on every load of the properties): ups may have
-    /// been missed while the old one was removed. The scroll mode the trigger key started would
-    /// not end: it is ended. As .NET (KEventHandler.hookInstalled): if Windows had removed the old
-    /// hook (old_hook_lost, e.g. for a timeout), the suppressed keys are forgotten; else they are
-    /// suppressed for their up alone (the trigger key held included).
-    pub fn on_keyboard_hook_installed(&mut self, old_hook_lost: bool, host: &mut impl TriggerHost) {
-        if old_hook_lost {
-            self.key_flags.forget_suppressed();
-        } else {
-            self.key_flags.suppressed_to_lone_up();
-        }
+    /// The keyboard hook has been replaced, and Windows had removed the old one (e.g. for a
+    /// timeout): keys may have been released and pressed again with no hook to see them. As .NET
+    /// (KEventHandler.hookInstalled), the suppressed keys are forgotten, and the scroll mode the
+    /// trigger key started (which would not end) is ended. A hook replaced while the old one was
+    /// still installed missed nothing: nothing is changed then (a scroll in progress goes on).
+    pub fn on_keyboard_hook_lost(&mut self, host: &mut impl TriggerHost) {
+        self.key_flags.forget_suppressed();
         if self.is_keyboard_scroll() {
             self.exit_scroll(host);
         }
@@ -1923,7 +1919,6 @@ mod tests {
         // Installed again when the pause ends: the trigger key works again
         engine.set_paused(false, &mut host);
         assert!(engine.keyboard_hook_enabled());
-        engine.on_keyboard_hook_installed(false, &mut host);
         assert_eq!(engine.handle_key(key(vk, KeyAction::Down, 800), &mut host), HookDecision::Suppress);
         assert!(engine.is_scrolling());
 
@@ -1956,14 +1951,17 @@ mod tests {
         cfg.target_vk_code = TriggerKey::VkLmenu;
         let vk = TriggerKey::VkLmenu.vk_code();
 
-        // The old hook was alive: the trigger key held ends its scroll, its up alone is suppressed.
+        // A load with the trigger key held (the hook replaced seamlessly: no engine call) ends its
+        // scroll; its repeats and its up stay suppressed, and no new scroll starts.
         let mut kb = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
             ResendTags::next_unique(),
         );
         kb.handle_key(key(vk, KeyAction::Down, 10), &mut host);
         assert!(kb.is_scrolling());
-        kb.on_keyboard_hook_installed(false, &mut host);
+        kb.end_scroll_after_load(&mut host);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 40), &mut host), HookDecision::Suppress);
         assert!(!kb.is_scrolling());
         assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 50), &mut host), HookDecision::Suppress);
 
@@ -1974,7 +1972,7 @@ mod tests {
             ResendTags::next_unique(),
         );
         lost.handle_key(key(vk, KeyAction::Down, 10), &mut host);
-        lost.on_keyboard_hook_installed(true, &mut host);
+        lost.on_keyboard_hook_lost(&mut host);
         assert!(!lost.is_scrolling());
         assert_eq!(lost.handle_key(key(vk, KeyAction::Up, 50), &mut host), HookDecision::Pass);
         assert_eq!(lost.handle_key(key(vk, KeyAction::Down, 90), &mut host), HookDecision::Suppress);
