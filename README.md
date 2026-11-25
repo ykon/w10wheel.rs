@@ -61,7 +61,7 @@ cargo build --release --locked
 
 単一の GUI バイナリ `.\target\release\W10Wheel.exe` が生成されます。C ランタイムは静的リンク、アイコン（`AppIcon.ico` / `TrayIcon-Run.ico` / `TrayIcon-Stop.ico`）とマニフェスト・バージョン情報は exe に埋め込まれるため、この exe だけで動作します（依存は Windows 標準の DLL のみ）。
 
-バージョンは `Cargo.toml` の `version`（.NET 版と同じ 2.10.1）が唯一の定義元で、`build.rs` が exe のバージョン情報とマニフェストに、バージョン情報画面が `CARGO_PKG_VERSION` から反映します。変更後は `Cargo.lock` の更新のため一度 `--locked` なしでビルドしてください。
+バージョンは `Cargo.toml` の `version` が唯一の定義元で、`build.rs` が exe のバージョン情報とマニフェストに、バージョン情報画面が `CARGO_PKG_VERSION` から反映します。変更後は `Cargo.lock` の更新のため一度 `--locked` なしでビルドしてください。
 
 Java 版・.NET 版とは `%TEMP%\W10Wheel.lock` で多重起動を排他するため、既存の W10Wheel が起動している場合は終了してから実行してください。
 
