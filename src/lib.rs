@@ -415,11 +415,18 @@ fn run_input_loop(
 
     let result = win32::message_loop(
         initial_keyboard_hook,
-        |error_code| {
-            // Not fatal (as in .NET): W10Wheel runs without the keyboard trigger, and says why
+        |installed| {
             APP.with_borrow_mut(|app| {
                 if let Some(app) = app.as_mut() {
-                    app.host.report_keyboard_hook_failure(error_code, true);
+                    match installed {
+                        // As a hook installed where there was none later (sync_keyboard_hook): a
+                        // trigger key held at the start (e.g. W10Wheel started by a shortcut with
+                        // it) passes until its up
+                        Ok(()) => app.engine.on_keyboard_hook_installed(&mut app.host),
+                        // Not fatal (as in .NET): W10Wheel runs without the keyboard trigger, and
+                        // says why
+                        Err(error_code) => app.host.report_keyboard_hook_failure(error_code, true),
+                    }
                 }
             });
         },

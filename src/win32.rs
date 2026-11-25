@@ -772,9 +772,12 @@ impl Hooks {
     }
 }
 
+/// `on_initial_keyboard_hook`: whether the keyboard hook could be installed at the start (Err:
+/// the Win32 error code), called before any event is handled; not called if it is not to be
+/// installed (`initial_keyboard_hook` false)
 pub(crate) fn message_loop(
     initial_keyboard_hook: bool,
-    on_keyboard_hook_failed: impl FnOnce(i32),
+    on_initial_keyboard_hook: impl FnOnce(Result<(), i32>),
     on_ready: impl FnOnce(u32),
     on_begin_close: impl FnOnce(),
     mut on_event: impl FnMut(LoopEvent, &mut Hooks),
@@ -785,8 +788,11 @@ pub(crate) fn message_loop(
     };
     if initial_keyboard_hook {
         match KeyboardHook::install() {
-            Ok(hook) => hooks.keyboard = Some(hook),
-            Err(err) => on_keyboard_hook_failed(err.raw_os_error().unwrap_or(0)),
+            Ok(hook) => {
+                hooks.keyboard = Some(hook);
+                on_initial_keyboard_hook(Ok(()));
+            }
+            Err(err) => on_initial_keyboard_hook(Err(err.raw_os_error().unwrap_or(0))),
         }
     }
     on_ready(unsafe { GetCurrentThreadId() });
