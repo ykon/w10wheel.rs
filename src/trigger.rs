@@ -388,8 +388,10 @@ impl TriggerEngine {
         self.scroll.is_some()
     }
 
+    /// Whether the keyboard hook is to be installed: the keyboard trigger is on, and not paused
+    /// (no keyboard hook while paused: nothing of the keyboard is seen nor kept then)
     pub fn keyboard_hook_enabled(&self) -> bool {
-        self.config.trigger.keyboard_enabled()
+        self.config.trigger.keyboard_enabled() && !self.paused
     }
 
     pub fn handle_mouse(
@@ -802,24 +804,9 @@ impl TriggerEngine {
             return true;
         }
 
+        // The keyboard hook is removed while paused (keyboard_hook_enabled)
         if self.paused {
-            return match event.action {
-                KeyAction::Down => {
-                    self.key_flags.kd_suppressed[vk] = false;
-                    self.key_flags.kd_lone_up[vk] = false;
-                    self.key_flags.kd_passed[vk] = true;
-                    true
-                }
-                KeyAction::Up => {
-                    if self.key_flags.kd_lone_up[vk] {
-                        self.key_flags.kd_lone_up[vk] = false;
-                        false
-                    } else {
-                        self.key_flags.kd_passed[vk] = false;
-                        true
-                    }
-                }
-            };
+            return true;
         }
 
         let is_trigger_key = self.config.trigger.keyboard_enabled()
@@ -1912,7 +1899,7 @@ mod tests {
     }
 
     #[test]
-    fn trigger_key_released_while_paused_is_suppressed_as_a_lone_up() {
+    fn keyboard_hook_is_off_while_paused() {
         let mut cfg = Config::default();
         cfg.keyboard_hook = true;
         cfg.target_vk_code = TriggerKey::VkLmenu;
@@ -1922,22 +1909,31 @@ mod tests {
         );
         let mut host = MockHost::new();
         let vk = TriggerKey::VkLmenu.vk_code();
+        assert!(engine.keyboard_hook_enabled());
 
         assert_eq!(engine.handle_key(key(vk, KeyAction::Down, 10), &mut host), HookDecision::Suppress);
         assert!(engine.is_scrolling());
         engine.set_paused(true, &mut host);
         assert!(!engine.is_scrolling());
-        // Its up alone would reach the application (Alt would activate the menu bar).
-        assert_eq!(engine.handle_key(key(vk, KeyAction::Up, 500), &mut host), HookDecision::Suppress);
+        // Removed while paused (the hook thread syncs it), so its records are reset
+        assert!(!engine.keyboard_hook_enabled());
+        engine.on_keyboard_hook_removed(&mut host);
+        assert_eq!(engine.handle_key(key(vk, KeyAction::Up, 500), &mut host), HookDecision::Pass);
 
-        // Pressed in Pause and held after it: its repeats and up pass, no scroll starts.
-        assert_eq!(engine.handle_key(key(vk, KeyAction::Down, 600), &mut host), HookDecision::Pass);
+        // Installed again when the pause ends: the trigger key works again
         engine.set_paused(false, &mut host);
-        assert_eq!(engine.handle_key(key(vk, KeyAction::Down, 650), &mut host), HookDecision::Pass);
-        assert!(!engine.is_scrolling());
-        assert_eq!(engine.handle_key(key(vk, KeyAction::Up, 700), &mut host), HookDecision::Pass);
+        assert!(engine.keyboard_hook_enabled());
+        engine.on_keyboard_hook_installed(false, &mut host);
         assert_eq!(engine.handle_key(key(vk, KeyAction::Down, 800), &mut host), HookDecision::Suppress);
         assert!(engine.is_scrolling());
+
+        // Turned off: not installed again when the pause ends
+        let mut off = cfg.clone();
+        off.keyboard_hook = false;
+        engine.set_config(EngineConfig::from_config(&off, &CustomTableState::default()), &mut host);
+        engine.set_paused(true, &mut host);
+        engine.set_paused(false, &mut host);
+        assert!(!engine.keyboard_hook_enabled());
     }
 
     #[test]

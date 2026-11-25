@@ -95,6 +95,8 @@ pub(crate) enum Command {
     /// The properties loaded (Reload, switching, adding, deleting or resetting them)
     Load(Box<EngineConfig>),
     InitState,
+    /// Installs the hooks again (after a resume or an unlock), to be first in the chain again
+    ReinstallHooks,
     WatchScroll(usize),
 }
 
@@ -731,18 +733,38 @@ impl Drop for KeyboardHook {
     }
 }
 
+/// The hooks of the hook thread
+pub(crate) struct Hooks {
+    mouse: MouseHook,
+    pub(crate) keyboard: Option<KeyboardHook>,
+}
+
+impl Hooks {
+    /// Installs the mouse hook again: the newest hook is called first, so this puts it before
+    /// the hooks installed after it (e.g. mouse software that installs its hook again after a
+    /// resume and then sees the buttons first, and passes on only the ones it injects). The new
+    /// hook is installed before the old one is removed (kept if that fails); no event is handled
+    /// in between, as the hooks are called on this thread only when it takes its messages.
+    pub(crate) fn reinstall_mouse(&mut self) -> io::Result<()> {
+        self.mouse = MouseHook::install()?;
+        Ok(())
+    }
+}
+
 pub(crate) fn message_loop(
     initial_keyboard_hook: bool,
     on_keyboard_hook_failed: impl FnOnce(i32),
     on_ready: impl FnOnce(u32),
     on_begin_close: impl FnOnce(),
-    mut on_event: impl FnMut(LoopEvent, &mut Option<KeyboardHook>),
+    mut on_event: impl FnMut(LoopEvent, &mut Hooks),
 ) -> io::Result<()> {
-    let mouse_hook = MouseHook::install()?;
-    let mut keyboard_hook = None;
+    let mut hooks = Hooks {
+        mouse: MouseHook::install()?,
+        keyboard: None,
+    };
     if initial_keyboard_hook {
         match KeyboardHook::install() {
-            Ok(hook) => keyboard_hook = Some(hook),
+            Ok(hook) => hooks.keyboard = Some(hook),
             Err(err) => on_keyboard_hook_failed(err.raw_os_error().unwrap_or(0)),
         }
     }
@@ -778,15 +800,15 @@ pub(crate) fn message_loop(
                             y,
                             time: message.time,
                         },
-                        &mut keyboard_hook,
+                        &mut hooks,
                     );
                 }
             }
             WM_TIMER if message.wparam == POLL_WAIT_TIMER => {
-                on_event(LoopEvent::PollTimeout, &mut keyboard_hook);
+                on_event(LoopEvent::PollTimeout, &mut hooks);
             }
             COMMAND_WAKE_MESSAGE if message.hwnd.is_null() => {
-                on_event(LoopEvent::Wake, &mut keyboard_hook);
+                on_event(LoopEvent::Wake, &mut hooks);
             }
             _ => {
                 unsafe { DispatchMessageW(&message) };
@@ -795,8 +817,7 @@ pub(crate) fn message_loop(
     }
     // End pending click sleeps/retries before unhooking to avoid SendInput/hook deadlocks.
     on_begin_close();
-    drop(mouse_hook);
-    drop(keyboard_hook);
+    drop(hooks);
     loop_result
 }
 

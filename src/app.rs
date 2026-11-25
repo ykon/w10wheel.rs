@@ -40,6 +40,17 @@ use crate::ui_win32::{
 const EXIT_RETRY_TIMER: usize = 3;
 const EXIT_RETRY_MS: u32 = 50;
 
+// The hooks are installed again after a resume or an unlock (see schedule_reinstall_hooks)
+const REINSTALL_HOOKS_TIMER: usize = 4;
+const REINSTALL_HOOKS_DELAYS_MS: [u32; 2] = [2_000, 8_000];
+
+const WM_POWERBROADCAST: u32 = 0x0218;
+const PBT_APMRESUMESUSPEND: usize = 0x0007;
+const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
+const WM_WTSSESSION_CHANGE: u32 = 0x02B1;
+const WTS_SESSION_UNLOCK: usize = 0x8;
+const NOTIFY_FOR_THIS_SESSION: u32 = 0;
+
 const TRAY_CLASS: &str = "W10WheelTrayHost";
 const ICON_ID: u32 = 1;
 const NOTIFYICON_VERSION_4: u32 = 4;
@@ -84,6 +95,12 @@ unsafe extern "system" {
     fn LoadIconW(hinstance: Handle, name: usize) -> Handle;
 }
 
+#[link(name = "wtsapi32")]
+unsafe extern "system" {
+    fn WTSRegisterSessionNotification(hwnd: Handle, flags: u32) -> i32;
+    fn WTSUnRegisterSessionNotification(hwnd: Handle) -> i32;
+}
+
 struct TrayHostState {
     shared: Rc<RefCell<AppShared>>,
     control: EngineControl,
@@ -96,6 +113,8 @@ struct TrayHostState {
     shutting_down: bool,
     // An exit waits for the nested message loops to return (see shutdown_host)
     exit_deferred: bool,
+    // The next of REINSTALL_HOOKS_DELAYS_MS after the one running
+    reinstall_hooks_step: usize,
 }
 
 pub(crate) fn main() -> ExitCode {
@@ -316,6 +335,7 @@ fn run(options: LaunchOptions) -> ExitCode {
         paused: false,
         shutting_down: false,
         exit_deferred: false,
+        reinstall_hooks_step: 0,
     });
 
     if let Err(err) = sync_tray(tray_host, &mut host_state) {
@@ -338,6 +358,8 @@ fn run(options: LaunchOptions) -> ExitCode {
     }
 
     let _ = engine.control().watch_scroll(tray_host as usize);
+    // For WTS_SESSION_UNLOCK. Without it (fails), only a resume installs the hooks again.
+    unsafe { WTSRegisterSessionNotification(tray_host, NOTIFY_FOR_THIS_SESSION) };
 
     if options.open_settings
         && let Some(ref mut s) = host_state.settings
@@ -413,6 +435,18 @@ unsafe extern "system" fn tray_wnd_proc(
                 state.cursor.retry_restore(&hw);
                 return 0;
             }
+            if wparam == REINSTALL_HOOKS_TIMER {
+                reinstall_hooks_on_timer(hwnd, state);
+                return 0;
+            }
+        }
+        WM_POWERBROADCAST
+            if wparam == PBT_APMRESUMEAUTOMATIC || wparam == PBT_APMRESUMESUSPEND =>
+        {
+            schedule_reinstall_hooks(hwnd, state);
+        }
+        WM_WTSSESSION_CHANGE if wparam == WTS_SESSION_UNLOCK => {
+            schedule_reinstall_hooks(hwnd, state);
         }
         IPC_COMMAND_MESSAGE => {
             handle_ipc_command(hwnd, state, wparam);
@@ -586,8 +620,32 @@ fn set_paused(hwnd: Handle, state: &mut TrayHostState, paused: bool) {
     }
 }
 
+/// After a resume or an unlock, the hooks are installed again, so that they are first in the
+/// chain again (the newest hook is called first). Mouse software can install its hook again then
+/// (e.g. X-Mouse Button Control). It is then called first, blocks the buttons it remaps and
+/// injects others, and W10Wheel ignores injected input: no mouse trigger works any more. The
+/// hooks are installed some time after the event, after the other software's, and once more later
+/// in case that software was late. Pausing and resuming does it at once (see HookApp::set_paused).
+fn schedule_reinstall_hooks(hwnd: Handle, state: &mut TrayHostState) {
+    state.reinstall_hooks_step = 1;
+    set_timer(hwnd, REINSTALL_HOOKS_TIMER, REINSTALL_HOOKS_DELAYS_MS[0]);
+}
+
+fn reinstall_hooks_on_timer(hwnd: Handle, state: &mut TrayHostState) {
+    let _ = state.control.reinstall_hooks();
+    match REINSTALL_HOOKS_DELAYS_MS.get(state.reinstall_hooks_step) {
+        Some(&delay) => {
+            state.reinstall_hooks_step += 1;
+            set_timer(hwnd, REINSTALL_HOOKS_TIMER, delay);
+        }
+        None => kill_timer(hwnd, REINSTALL_HOOKS_TIMER),
+    }
+}
+
 fn cleanup_tray_resources(hwnd: Handle, state: &mut TrayHostState) {
     kill_timer(hwnd, RESTORE_TIMER);
+    kill_timer(hwnd, REINSTALL_HOOKS_TIMER);
+    unsafe { WTSUnRegisterSessionNotification(hwnd) };
     let _ = state.control.watch_scroll(0);
     let hw = unsafe { w::HWND::from_ptr(hwnd) };
     let _ = state.cursor.restore();

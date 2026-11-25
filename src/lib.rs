@@ -195,7 +195,7 @@ impl HookApp {
         }
     }
 
-    fn on_event(&mut self, event: LoopEvent, keyboard_hook: &mut Option<win32::KeyboardHook>) {
+    fn on_event(&mut self, event: LoopEvent, hooks: &mut win32::Hooks) {
         match event {
             LoopEvent::RawMotion { x, y, time } => {
                 self.engine.on_raw_motion(x, y, time, &mut self.host);
@@ -207,39 +207,33 @@ impl HookApp {
                 while let Some(ipc_cmd) = self.pending_ipc.pop_front() {
                     match ipc_cmd {
                         IpcCommand::SendExit => win32::quit(),
-                        IpcCommand::SendPassMode(paused) => {
-                            self.engine.set_paused(paused, &mut self.host);
-                        }
+                        IpcCommand::SendPassMode(paused) => self.set_paused(paused, hooks),
                         IpcCommand::SendInitState => {
                             self.engine.init_state(&mut self.host);
-                            self.sync_keyboard_hook(keyboard_hook, true);
+                            self.sync_keyboard_hook(&mut hooks.keyboard, true);
                         }
                         IpcCommand::SendReloadProp => {}
                     }
                 }
                 while let Ok(command) = self.commands.try_recv() {
                     match command {
-                        // The keyboard hook stays installed while paused, as in .NET: the keys
-                        // pressed meanwhile are recorded (their repeats and up pass after it),
-                        // and the up alone of a key suppressed before is suppressed.
-                        Command::Pause(paused) => {
-                            self.engine.set_paused(paused, &mut self.host);
-                        }
+                        Command::Pause(paused) => self.set_paused(paused, hooks),
                         Command::Config(config) => {
                             self.engine.set_config(*config, &mut self.host);
-                            self.sync_keyboard_hook(keyboard_hook, false);
+                            self.sync_keyboard_hook(&mut hooks.keyboard, false);
                         }
                         Command::Load(config) => {
                             self.engine.set_config(*config, &mut self.host);
                             // Installed again on every load, as in .NET (e.g. a Reload after
                             // Windows removed it for a timeout)
-                            self.sync_keyboard_hook(keyboard_hook, true);
+                            self.sync_keyboard_hook(&mut hooks.keyboard, true);
                             self.engine.end_scroll_after_load(&mut self.host);
                         }
                         Command::InitState => {
                             self.engine.init_state(&mut self.host);
-                            self.sync_keyboard_hook(keyboard_hook, true);
+                            self.sync_keyboard_hook(&mut hooks.keyboard, true);
                         }
+                        Command::ReinstallHooks => self.reinstall_hooks(hooks),
                         Command::Stop => win32::quit(),
                         Command::WatchScroll(window) => {
                             self.host.scroll_window = window;
@@ -255,6 +249,31 @@ impl HookApp {
                 }
             }
         }
+    }
+
+    /// While paused, the keyboard hook is removed (unlike .NET, which keeps it and passes the
+    /// keys): nothing of the keyboard is seen then. The up of a key held when the pause starts
+    /// passes alone, and a key held when it ends is a new press.
+    /// The mouse hook stays, as it receives the commands (W10Message), and passes all.
+    /// When the pause ends, the hooks are installed again. Pausing and resuming (Pass Mode) is
+    /// then also the way to put them first again by hand, e.g. after mouse software that was
+    /// turned off and on installed its hook again.
+    fn set_paused(&mut self, paused: bool, hooks: &mut win32::Hooks) {
+        self.engine.set_paused(paused, &mut self.host);
+        if paused {
+            self.sync_keyboard_hook(&mut hooks.keyboard, false);
+        } else {
+            self.reinstall_hooks(hooks);
+        }
+    }
+
+    /// Installs the hooks again, to be first in the chain again (the newest hook is called
+    /// first). If the mouse hook cannot be installed now, the old one stays. If the keyboard
+    /// hook cannot, it is reported as at a load (the setting is turned off but not stored).
+    /// While paused, the keyboard hook stays removed.
+    fn reinstall_hooks(&mut self, hooks: &mut win32::Hooks) {
+        let _ = hooks.reinstall_mouse();
+        self.sync_keyboard_hook(&mut hooks.keyboard, true);
     }
 
     fn sync_keyboard_hook(&mut self, keyboard_hook: &mut Option<win32::KeyboardHook>, reinstall: bool) {
@@ -383,10 +402,10 @@ fn run_input_loop(
         },
         on_ready,
         move || begin_close_handle.begin_close(),
-        |event, keyboard_hook| {
+        |event, hooks| {
             APP.with_borrow_mut(|app| {
                 if let Some(app) = app.as_mut() {
-                    app.on_event(event, keyboard_hook);
+                    app.on_event(event, hooks);
                 }
             });
         },
@@ -432,6 +451,11 @@ impl EngineControl {
 
     pub fn init_state(&self) -> io::Result<()> {
         self.send(Command::InitState)
+    }
+
+    /// Installs the hooks again (after a resume or an unlock): first in the chain again
+    pub fn reinstall_hooks(&self) -> io::Result<()> {
+        self.send(Command::ReinstallHooks)
     }
 
     pub fn watch_scroll(&self, window: usize) -> io::Result<()> {
