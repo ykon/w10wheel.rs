@@ -406,30 +406,32 @@ pub struct PropertiesFile;
 
 impl PropertiesFile {
     pub fn read_map(path: &Path) -> io::Result<BTreeMap<String, String>> {
-        let file = TextFile::read(path)?;
+        Ok(Self::map_of(&TextFile::read(path)?))
+    }
+
+    /// The properties of a text, as read_map reads them
+    fn map_of(file: &TextFile) -> BTreeMap<String, String> {
         let mut map = BTreeMap::new();
         for line in &file.lines {
             if let Some((key, value)) = parse_line(line) {
                 map.insert(key.to_owned(), value.to_owned());
             }
         }
-        Ok(map)
+        map
     }
 
     pub fn store_map(path: &Path, map: &BTreeMap<String, String>) -> io::Result<()> {
-        Self::store_map_written(path, map).map(drop)
+        TextFile::write(path, &Self::text_of(map))
     }
 
-    /// As store_map, returning the bytes written
-    fn store_map_written(path: &Path, map: &BTreeMap<String, String>) -> io::Result<Vec<u8>> {
+    /// A new properties file with all of `map` (UTF-8, CRLF, sorted)
+    fn text_of(map: &BTreeMap<String, String>) -> TextFile {
         let lines = map.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        let file = TextFile {
+        TextFile {
             lines,
             newline: "\r\n".to_owned(),
             encoding: TextEncoding::Utf8 { bom: false },
-        };
-        TextFile::write(path, &file)?;
-        Ok(file.to_bytes())
+        }
     }
 
     /// Updates only `keys` in `path`, preserving existing comments, formatting, line endings,
@@ -439,16 +441,12 @@ impl PropertiesFile {
         values: &BTreeMap<String, String>,
         keys: &[String],
     ) -> io::Result<()> {
-        Self::update_keys_written(path, values, keys).map(drop)
+        let updated = Self::updated(TextFile::read(path)?, values, keys);
+        TextFile::write(path, &updated)
     }
 
-    /// As update_keys, returning the bytes written
-    fn update_keys_written(
-        path: &Path,
-        values: &BTreeMap<String, String>,
-        keys: &[String],
-    ) -> io::Result<Vec<u8>> {
-        let file = TextFile::read(path)?;
+    /// `file` with `keys` set to their `values` (see update_keys)
+    fn updated(file: TextFile, values: &BTreeMap<String, String>, keys: &[String]) -> TextFile {
         let to_write: HashSet<&str> = keys.iter().map(String::as_str).collect();
         let mut written: HashSet<String> = HashSet::new();
 
@@ -480,13 +478,11 @@ impl PropertiesFile {
             }
         }
 
-        let updated = TextFile {
+        TextFile {
             lines: new_lines,
             newline: file.newline,
             encoding: file.encoding,
-        };
-        TextFile::write(path, &updated)?;
-        Ok(updated.to_bytes())
+        }
     }
 }
 
@@ -599,29 +595,55 @@ pub fn validate_new_profile_name(dir: &Path, name: &str) -> Result<(), ProfileNa
     Ok(())
 }
 
-/// The properties file of new properties made at `dest`, only if there is none (create_new): the
-/// name is reserved at once, so a file made there by another program since the name was checked is
-/// not replaced (an AlreadyExists error), as .NET File.Copy fails. It has the contents of `src` if
-/// that exists (its comments, its other keys; not its attributes, e.g. read-only): its bytes then,
-/// else it is empty (None). Removed again if the copy fails.
-fn create_profile_file(src: &Path, dest: &Path) -> io::Result<Option<Vec<u8>>> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(dest)?;
-    let copied = (|| -> io::Result<Option<Vec<u8>>> {
-        match fs::read(src) {
-            Ok(bytes) => {
-                file.write_all(&bytes)?;
-                file.sync_all()?;
-                Ok(Some(bytes))
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(err) => Err(err),
+/// The properties file of new properties (ConfigStore::add_profile), held open from its creation
+/// until the Add is done. Created only if there is none (create_new): a file made there by another
+/// program since the name was checked is not replaced (an AlreadyExists error), as .NET File.Copy
+/// fails. Written whole at once with its final contents, through this handle, which shares only
+/// reading: while it is held, no other program can write, replace, rename or delete the file. So
+/// the file written, and the one deleted if the Add fails (discard), is always this one.
+struct NewProfileFile {
+    file: fs::File,
+}
+
+impl NewProfileFile {
+    fn create(path: &Path, contents: &[u8]) -> io::Result<Self> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let file = OpenOptions::new()
+            // write: needed by OpenOptions for create_new (the access is access_mode)
+            .write(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE_ACCESS)
+            .share_mode(FILE_SHARE_READ)
+            .create_new(true)
+            .open(path)?;
+        let mut new = Self { file };
+        let written = new.file.write_all(contents).and_then(|()| new.file.sync_all());
+        if let Err(err) = written {
+            let _ = new.discard();
+            return Err(err);
         }
-    })();
-    drop(file);
-    if copied.is_err() {
-        let _ = fs::remove_file(dest);
+        Ok(new)
     }
-    copied
+
+    /// The Add failed: this file (not whatever is at its path) is deleted when the handle closes
+    fn discard(self) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+
+        // FILE_DISPOSITION_INFO { DeleteFile: TRUE }
+        let delete: u8 = 1;
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                self.file.as_raw_handle(),
+                FILE_DISPOSITION_INFO_CLASS,
+                (&raw const delete).cast(),
+                size_of::<u8>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 }
 
 #[link(name = "kernel32")]
@@ -636,41 +658,9 @@ unsafe extern "system" {
 
 const DELETE_ACCESS: u32 = 0x0001_0000;
 const GENERIC_READ: u32 = 0x8000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const FILE_SHARE_READ: u32 = 0x0000_0001;
 const FILE_DISPOSITION_INFO_CLASS: u32 = 4;
-
-/// Deletes `path` only if it still has exactly `contents`: the file written by this process, not
-/// one that another program has put there since (true if deleted). The file is opened for itself
-/// (no sharing) to read and delete it, so it cannot be replaced in between; a file that cannot be
-/// opened so (e.g. open in another program) is not deleted.
-fn delete_if_contents(path: &Path, contents: &[u8]) -> io::Result<bool> {
-    use std::io::Read;
-    use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
-
-    let mut file = OpenOptions::new()
-        .access_mode(GENERIC_READ | DELETE_ACCESS)
-        .share_mode(0)
-        .open(path)?;
-    let mut current = Vec::with_capacity(contents.len());
-    file.read_to_end(&mut current)?;
-    if current != contents {
-        return Ok(false);
-    }
-    // FILE_DISPOSITION_INFO { DeleteFile: TRUE }: deleted when this handle is closed
-    let delete: u8 = 1;
-    let ok = unsafe {
-        SetFileInformationByHandle(
-            file.as_raw_handle(),
-            FILE_DISPOSITION_INFO_CLASS,
-            (&raw const delete).cast(),
-            size_of::<u8>() as u32,
-        )
-    };
-    if ok == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(true)
-}
 
 pub fn delete_profile(dir: &Path, name: &str) -> io::Result<()> {
     if name == DEFAULT_PROFILE {
@@ -1047,55 +1037,49 @@ impl ConfigStore {
         let current = self.config.to_property_map();
         let all_keys: Vec<String> = current.keys().cloned().collect();
 
-        let lang = self.lang();
-        // The contents of the properties file as this Add last wrote them (None: not made)
-        let mut written: Option<Vec<u8>> = None;
-        let write_result = (|| -> io::Result<()> {
-            // Made by another program since the name was checked: not replaced (its contents
-            // would be lost), the Add fails as for a name that exists
-            let copied = create_profile_file(&src_path, &dest_path).map_err(|err| {
-                if err.kind() == io::ErrorKind::AlreadyExists {
-                    io::Error::new(
-                        io::ErrorKind::AlreadyExists,
-                        crate::locale::tr(
-                            lang,
-                            crate::locale::profile_name_error_key(ProfileNameError::AlreadyExists),
-                        ),
-                    )
-                } else {
-                    err
-                }
-            })?;
-            // As made (the copy, or empty), until the settings are written into it
-            written = Some(copied.clone().unwrap_or_default());
-            written = Some(if copied.is_some() {
-                PropertiesFile::update_keys_written(&dest_path, &current, &all_keys)?
-            } else {
-                PropertiesFile::store_map_written(&dest_path, &current)?
-            });
-            // The excluded programs running, always, as .NET (Ctx.addProperties): an exclusions
-            // file of this name without its properties is a leftover of earlier properties (e.g.
-            // deleted while the file was locked, see delete_profile, or outside W10Wheel). It is
-            // replaced by the list, or deleted if there is none, so that it does not come back
-            // as the list of the new properties. Written whole or not at all (the old one stays).
-            ExclusionsFile::write(&dest_excl, &self.exclusions)?;
-            Ok(())
-        })();
+        // The new properties, complete before their file is made: a copy of the selected ones
+        // (their comments, their other keys, e.g. the custom table) with the settings running,
+        // or all the settings if they have no file
+        let contents = match TextFile::read(&src_path) {
+            Ok(src) => PropertiesFile::updated(src, &current, &all_keys),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => PropertiesFile::text_of(&current),
+            Err(err) => return Err(err),
+        };
 
-        if let Err(err) = write_result {
-            // Not left half made: the properties file made by this Add is deleted, they can be
-            // added again. Only if it is still the one this Add wrote: a file another program has
-            // put there since (e.g. while the excluded programs were written) is kept. (.NET
-            // deletes the path whatever is there.)
-            if let Some(contents) = written {
-                let _ = delete_if_contents(&dest_path, &contents);
+        // Made with them, and held until the Add is done (see NewProfileFile). Made by another
+        // program since the name was checked: not replaced, the Add fails as for a name that exists
+        let lang = self.lang();
+        let new_file = NewProfileFile::create(&dest_path, &contents.to_bytes()).map_err(|err| {
+            if err.kind() == io::ErrorKind::AlreadyExists {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    crate::locale::tr(
+                        lang,
+                        crate::locale::profile_name_error_key(ProfileNameError::AlreadyExists),
+                    ),
+                )
+            } else {
+                err
             }
+        })?;
+
+        // The excluded programs running, always, as .NET (Ctx.addProperties): an exclusions file
+        // of this name without its properties is a leftover of earlier properties (e.g. deleted
+        // while the file was locked, see delete_profile, or outside W10Wheel). It is replaced by
+        // the list, or deleted if there is none, so that it does not come back as the list of the
+        // new properties. Written whole or not at all (the old one stays).
+        if let Err(err) = ExclusionsFile::write(&dest_excl, &self.exclusions) {
+            // Not left half made: the properties file made by this Add is deleted (that file, held
+            // since: nothing else can be at its path), they can be added again
+            let _ = new_file.discard();
             return Err(err);
         }
+        drop(new_file);
 
-        let map = PropertiesFile::read_map(&dest_path)?;
-        let exclusions = ExclusionsFile::read(&dest_excl);
-        self.apply_loaded(name.to_owned(), &map, exclusions);
+        // Loaded from what was written, not read again from the files (released now)
+        let map = PropertiesFile::map_of(&contents);
+        let exclusions = self.exclusions.clone();
+        self.apply_loaded(name.to_owned(), &map, Ok(exclusions));
         Ok(())
     }
 
@@ -1751,59 +1735,68 @@ mod tests {
     #[test]
     fn a_properties_file_made_by_another_program_meanwhile_is_not_replaced() -> io::Result<()> {
         let dir = TestDir::new()?;
-        let src = profile_path(&dir.0, DEFAULT_PROFILE);
-        fs::write(&src, "# mine\r\nreverseScroll=true\r\n")?;
-
         // Made by another program after the name was checked
         let dest = profile_path(&dir.0, "Work");
         fs::write(&dest, "# theirs\r\n")?;
-        let err = create_profile_file(&src, &dest).unwrap_err();
+        let err = NewProfileFile::create(&dest, b"# mine\r\n").err().unwrap();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read_to_string(&dest)?, "# theirs\r\n");
-
-        // Free: a copy of the source (its comments too), or empty without one
-        let free = profile_path(&dir.0, "Home");
-        assert_eq!(
-            create_profile_file(&src, &free)?.as_deref(),
-            Some("# mine\r\nreverseScroll=true\r\n".as_bytes())
-        );
-        assert_eq!(fs::read_to_string(&free)?, "# mine\r\nreverseScroll=true\r\n");
-        let empty = profile_path(&dir.0, "Empty");
-        assert!(create_profile_file(&dir.0.join("missing.properties"), &empty)?.is_none());
-        assert_eq!(fs::read(&empty)?.len(), 0);
         Ok(())
     }
 
     #[test]
-    fn a_failed_add_deletes_only_the_properties_file_it_wrote() -> io::Result<()> {
+    fn the_new_properties_file_cannot_be_replaced_while_held_and_discard_deletes_only_it()
+    -> io::Result<()> {
         let dir = TestDir::new()?;
-        let mut map = BTreeMap::new();
-        map.insert("a".to_owned(), "1".to_owned());
+        let path = profile_path(&dir.0, "Work");
+        let mine = b"# mine\r\nreverseScroll=true\r\n";
+        let new_file = NewProfileFile::create(&path, mine)?;
 
-        // The bytes reported are those on the disk (the file is recognized as this Add's)
-        let path = dir.0.join("mine.properties");
-        let written = PropertiesFile::store_map_written(&path, &map)?;
-        assert_eq!(fs::read(&path)?, written);
-        map.insert("b".to_owned(), "2".to_owned());
-        let keys = vec!["b".to_owned()];
-        let updated = PropertiesFile::update_keys_written(&path, &map, &keys)?;
-        assert_eq!(fs::read(&path)?, updated);
-        assert!(delete_if_contents(&path, &updated)?);
+        // While held, another program can read it, but not replace it (also with the same
+        // contents: another file), write into it, rename it or delete it
+        assert_eq!(fs::read(&path)?, mine);
+        let other = dir.0.join("other.properties");
+        fs::write(&other, mine)?;
+        assert!(fs::rename(&other, &path).is_err());
+        assert!(PropertiesFile::store_map(&path, &BTreeMap::new()).is_err());
+        assert!(OpenOptions::new().write(true).open(&path).is_err());
+        assert!(fs::rename(&path, dir.0.join("moved.properties")).is_err());
+        assert!(fs::remove_file(&path).is_err());
+        assert_eq!(fs::read(&path)?, mine);
+
+        // The Add failed: this file is deleted (nothing else can be at its path)
+        new_file.discard()?;
         assert!(!path.exists());
+        assert!(other.is_file());
 
-        // Replaced by another program meanwhile: kept
-        let theirs = dir.0.join("theirs.properties");
-        let mine = PropertiesFile::store_map_written(&theirs, &map)?;
-        fs::write(&theirs, "# made by another program\r\n")?;
-        assert!(!delete_if_contents(&theirs, &mine)?);
-        assert_eq!(fs::read_to_string(&theirs)?, "# made by another program\r\n");
+        // The Add done: the file stays with its contents, free again
+        let kept = NewProfileFile::create(&path, mine)?;
+        drop(kept);
+        assert_eq!(fs::read(&path)?, mine);
+        fs::remove_file(&path)?;
+        Ok(())
+    }
 
-        // Open in another program (cannot be opened for itself): not deleted either
-        fs::write(&theirs, &mine)?;
-        let open = OpenOptions::new().read(true).share_mode(0x1).open(&theirs)?;
-        assert!(delete_if_contents(&theirs, &mine).is_err());
-        drop(open);
-        assert!(theirs.exists());
+    #[test]
+    fn added_properties_are_a_copy_with_the_settings_running() -> io::Result<()> {
+        let dir = TestDir::new()?;
+        let default_prop = profile_path(&dir.0, DEFAULT_PROFILE);
+        fs::write(
+            &default_prop,
+            "# my comment\r\ncustomAccelThreshold=1, 5\r\ncustomAccelMultiplier=1.0, 2.0\r\n",
+        )?;
+        let mut store = ConfigStore::open_in(dir.0.clone(), UiLanguage::En);
+        store.load_startup(None);
+        store.config_mut().reverse_scroll = true;
+        store.add_profile("Work")?;
+
+        let text = fs::read_to_string(profile_path(&dir.0, "Work"))?;
+        assert!(text.starts_with("# my comment\r\ncustomAccelThreshold=1, 5\r\n"));
+        assert!(text.contains("reverseScroll=true\r\n"));
+        assert_eq!(store.selected_profile(), "Work");
+        assert!(store.config().reverse_scroll);
+        assert!(matches!(store.custom_table(), CustomTableState::Loaded { .. }));
+        assert!(!store.has_unsaved_changes());
         Ok(())
     }
 
