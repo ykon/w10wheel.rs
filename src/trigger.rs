@@ -1029,11 +1029,8 @@ impl TriggerEngine {
     /// timeout): keys may have been released, and pressed again, with no hook to see it (the new
     /// down reached the application). So nothing of before is kept: the scroll mode of the
     /// trigger key is ended and all the keys' records are forgotten (a key passed over an
-    /// excluded window and released meanwhile would pass its next press). If the trigger key is
-    /// down now, it is taken as passed: its repeats and its up pass (they would start a scroll,
-    /// or the up of a down that reached the application be suppressed); its next press is the
-    /// trigger. The other keys pass anyway. GetAsyncKeyState tells only what it can (0 also when
-    /// it cannot): a key taken as up is a new press.
+    /// excluded window and released meanwhile would pass its next press). A trigger key held now
+    /// passes (see pass_held_trigger_key). The other keys pass anyway.
     /// A hook replaced while the old one was still installed missed nothing: nothing is changed
     /// then.
     pub fn on_keyboard_hook_lost(&mut self, host: &mut impl TriggerHost) {
@@ -1041,6 +1038,23 @@ impl TriggerEngine {
             self.exit_scroll(host);
         }
         self.key_flags.reset();
+        self.pass_held_trigger_key(host);
+    }
+
+    /// The keyboard hook has been installed where there was none (at the end of a pause, at
+    /// startup, or turned on): the keys' records were reset when it was removed or could not be
+    /// installed, and the keys pressed meanwhile reached the application. A trigger key held now
+    /// passes (see pass_held_trigger_key): its repeats would start a scroll, and its up be
+    /// suppressed, the key left pressed in the application.
+    pub fn on_keyboard_hook_installed(&mut self, host: &mut impl TriggerHost) {
+        self.pass_held_trigger_key(host);
+    }
+
+    /// The trigger key, if it is down now, is taken as passed: its down reached the application
+    /// with no hook to see it, so its repeats and its up pass, and its next press is the trigger.
+    /// GetAsyncKeyState tells only what it can (0 also when it cannot): a key taken as up is a
+    /// new press. Not the key that does not repeat (Pause): its down is always a new press.
+    fn pass_held_trigger_key(&mut self, host: &mut impl TriggerHost) {
         let trigger = self.config.trigger.target_vk_code.vk_code();
         if self.config.trigger.keyboard_enabled()
             && trigger != VK_PAUSE
@@ -2235,5 +2249,38 @@ mod tests {
         assert_eq!(lost.handle_key(key(vk, KeyAction::Up, 50), &mut host), HookDecision::Pass);
         assert_eq!(lost.handle_key(key(vk, KeyAction::Down, 90), &mut host), HookDecision::Suppress);
         assert!(lost.is_scrolling());
+    }
+
+    #[test]
+    fn installed_keyboard_hook_passes_held_trigger_key() {
+        let mut cfg = Config::default();
+        cfg.keyboard_hook = true;
+        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let vk = TriggerKey::VkLmenu.vk_code();
+        let mut kb = TriggerEngine::new(
+            EngineConfig::from_config(&cfg, &CustomTableState::default()),
+            ResendTags::next_unique(),
+        );
+        let mut host = MockHost::new();
+
+        // Pressed while paused (no hook: its down reached the application), held at the end of
+        // the pause: its repeats and its up pass, no scroll starts. The next press is the trigger.
+        kb.on_keyboard_hook_removed(&mut host);
+        host.keys_down.push(vk);
+        kb.on_keyboard_hook_installed(&mut host);
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 30), &mut host), HookDecision::Pass);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 100), &mut host), HookDecision::Pass);
+        host.keys_down.clear();
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 200), &mut host), HookDecision::Suppress);
+        assert!(kb.is_scrolling());
+        kb.handle_key(key(vk, KeyAction::Up, 300), &mut host);
+
+        // Not held at the end of the pause: its first press is the trigger.
+        kb.init_state(&mut host);
+        kb.on_keyboard_hook_removed(&mut host);
+        kb.on_keyboard_hook_installed(&mut host);
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 400), &mut host), HookDecision::Suppress);
+        assert!(kb.is_scrolling());
     }
 }

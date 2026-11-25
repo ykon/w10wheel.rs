@@ -258,7 +258,8 @@ impl HookApp {
 
     /// While paused, the keyboard hook is removed (unlike .NET, which keeps it and passes the
     /// keys): nothing of the keyboard is seen then. The up of a key held when the pause starts
-    /// passes alone, and a key held when it ends is a new press.
+    /// passes alone; the trigger key held when it ends passes until its up
+    /// (on_keyboard_hook_installed), the other keys pass anyway.
     /// The mouse hook stays, as it receives the commands (W10Message), and passes all.
     /// When the pause ends, the hooks are installed again. Pausing and resuming (Pass Mode) is
     /// then also the way to put them first again by hand, e.g. after mouse software that was
@@ -290,13 +291,17 @@ impl HookApp {
     fn sync_keyboard_hook(&mut self, keyboard_hook: &mut Option<win32::KeyboardHook>, reinstall: bool) {
         let enabled = self.engine.keyboard_hook_enabled();
         match win32::KeyboardHook::sync(keyboard_hook, enabled, reinstall) {
-            // Installed where there was none: no records of keys are kept (reset when it was
-            // removed or could not be installed). Replaced seamlessly: they still hold.
+            // Replaced seamlessly: the records of the keys still hold.
             win32::KeyboardHookSync::Unchanged
-            | win32::KeyboardHookSync::Installed
             | win32::KeyboardHookSync::Replaced {
                 old_hook_lost: false,
             } => {}
+            // Installed where there was none (the end of a pause, startup, turned on): no records
+            // of keys are kept (reset when it was removed or could not be installed); a trigger
+            // key held now passes until its up.
+            win32::KeyboardHookSync::Installed => {
+                self.engine.on_keyboard_hook_installed(&mut self.host);
+            }
             win32::KeyboardHookSync::Replaced {
                 old_hook_lost: true,
             } => {
@@ -410,11 +415,18 @@ fn run_input_loop(
 
     let result = win32::message_loop(
         initial_keyboard_hook,
-        |error_code| {
-            // Not fatal (as in .NET): W10Wheel runs without the keyboard trigger, and says why
+        |installed| {
             APP.with_borrow_mut(|app| {
                 if let Some(app) = app.as_mut() {
-                    app.host.report_keyboard_hook_failure(error_code, true);
+                    match installed {
+                        // As a hook installed where there was none later (sync_keyboard_hook): a
+                        // trigger key held at the start (e.g. W10Wheel started by a shortcut with
+                        // it) passes until its up
+                        Ok(()) => app.engine.on_keyboard_hook_installed(&mut app.host),
+                        // Not fatal (as in .NET): W10Wheel runs without the keyboard trigger, and
+                        // says why
+                        Err(error_code) => app.host.report_keyboard_hook_failure(error_code, true),
+                    }
                 }
             });
         },

@@ -575,9 +575,12 @@ impl SettingsWindow {
         self.state.commit_all_numbers();
     }
 
-    pub fn refresh(&mut self) {
-        self.state.retext_all();
-        self.state.refresh_all();
+    /// Shows the settings again, nothing having been loaded (e.g. the keyboard trigger turned off
+    /// because its hook could not be installed): the lists of the properties and of the excluded
+    /// programs are not read again, and a number being typed is kept (it is stored as it would
+    /// have been), as .NET does (RefreshLater).
+    pub fn refresh_values(&mut self) {
+        self.state.refresh_values();
     }
 
     pub fn apply_theme(&mut self, dark: bool) {
@@ -604,7 +607,8 @@ impl SettingsWindow {
 
     pub fn on_admin_restart_result(&mut self, wparam: usize) {
         self.shared.borrow_mut().restarting_admin = false;
-        self.state.refresh_all();
+        // Nothing loaded: only the button enabled again
+        self.state.refresh_values();
         if wparam == ADMIN_RESTART_FAILED {
             let (lang, dark, err_opt) = {
                 let s = self.shared.borrow();
@@ -2107,30 +2111,49 @@ impl SettingsState {
     }
 
     fn refresh_all(&mut self) {
+        self.refresh_with(true);
+    }
+
+    /// As refresh_all, without reading the list of the properties again (unless the current one
+    /// is not in it), nor the excluded programs (their selection kept), nor dropping a number
+    /// being typed: its text stays and it is stored later, as it would have been (the debounce
+    /// timer goes on). Not in a box disabled now: its value is shown again (enable_number_row).
+    fn refresh_values(&mut self) {
+        self.refresh_with(false);
+    }
+
+    fn refresh_with(&mut self, read_lists: bool) {
         self.refreshing = true;
         self.disabled_labels.clear();
+        let keep_pending = !read_lists;
         {
             let shared = self.shared.borrow();
             let cfg = shared.store.config();
             let lang = cfg.ui_language;
 
             // Profile Bar
-            self.profile_names.clear();
-            self.profile_names.push(DEFAULT_PROFILE.to_owned());
-            if let Some(dir) = shared.store.dir() {
-                for name in list_profiles(dir) {
-                    self.profile_names.push(name);
+            let listed = self
+                .profile_names
+                .iter()
+                .any(|n| n == shared.store.selected_profile());
+            if read_lists || !listed {
+                self.profile_names.clear();
+                self.profile_names.push(DEFAULT_PROFILE.to_owned());
+                if let Some(dir) = shared.store.dir() {
+                    for name in list_profiles(dir) {
+                        self.profile_names.push(name);
+                    }
                 }
-            }
-            send_msg(self.profile_combo, CB_RESETCONTENT, 0, 0);
-            for (idx, name) in self.profile_names.iter().enumerate() {
-                let display = if idx == 0 {
-                    tr(lang, "Default")
-                } else {
-                    name.as_str()
-                };
-                let w = to_wide(display);
-                send_msg(self.profile_combo, CB_ADDSTRING, 0, w.as_ptr() as isize);
+                send_msg(self.profile_combo, CB_RESETCONTENT, 0, 0);
+                for (idx, name) in self.profile_names.iter().enumerate() {
+                    let display = if idx == 0 {
+                        tr(lang, "Default")
+                    } else {
+                        name.as_str()
+                    };
+                    let w = to_wide(display);
+                    send_msg(self.profile_combo, CB_ADDSTRING, 0, w.as_ptr() as isize);
+                }
             }
             let selected_idx = self
                 .profile_names
@@ -2195,7 +2218,8 @@ impl SettingsState {
             enable_number_row(
                 &mut self.disabled_labels,
                 self.poll_timeout_lbl,
-                &self.numbers,
+                &mut self.numbers,
+                keep_pending,
                 ID_POLL_TIMEOUT_EDIT,
                 dbl,
                 cfg.poll_timeout,
@@ -2204,7 +2228,8 @@ impl SettingsState {
             enable_number_row(
                 &mut self.disabled_labels,
                 self.scroll_locktime_lbl,
-                &self.numbers,
+                &mut self.numbers,
+                keep_pending,
                 ID_SCROLL_LOCKTIME_EDIT,
                 lock_en,
                 cfg.scroll_locktime,
@@ -2227,7 +2252,8 @@ impl SettingsState {
             enable_number_row(
                 &mut self.disabled_labels,
                 self.v_thresh_lbl,
-                &self.numbers,
+                &mut self.numbers,
+                keep_pending,
                 ID_V_THRESH_EDIT,
                 !vha_active,
                 cfg.vertical_threshold,
@@ -2235,7 +2261,8 @@ impl SettingsState {
             enable_number_row(
                 &mut self.disabled_labels,
                 self.h_thresh_lbl,
-                &self.numbers,
+                &mut self.numbers,
+                keep_pending,
                 ID_H_THRESH_EDIT,
                 cfg.horizontal_scroll && !vha_active,
                 cfg.horizontal_threshold,
@@ -2267,7 +2294,8 @@ impl SettingsState {
             enable_number_row(
                 &mut self.disabled_labels,
                 self.wheel_delta_lbl,
-                &self.numbers,
+                &mut self.numbers,
+                keep_pending,
                 ID_WHEEL_DELTA_EDIT,
                 rw,
                 cfg.wheel_delta,
@@ -2275,7 +2303,8 @@ impl SettingsState {
             enable_number_row(
                 &mut self.disabled_labels,
                 self.v_wheel_move_lbl,
-                &self.numbers,
+                &mut self.numbers,
+                keep_pending,
                 ID_V_WHEEL_MOVE_EDIT,
                 rw,
                 cfg.v_wheel_move,
@@ -2283,7 +2312,8 @@ impl SettingsState {
             enable_number_row(
                 &mut self.disabled_labels,
                 self.h_wheel_move_lbl,
-                &self.numbers,
+                &mut self.numbers,
+                keep_pending,
                 ID_H_WHEEL_MOVE_EDIT,
                 rw && cfg.horizontal_scroll,
                 cfg.h_wheel_move,
@@ -2308,7 +2338,8 @@ impl SettingsState {
             enable_number_row(
                 &mut self.disabled_labels,
                 self.first_min_lbl,
-                &self.numbers,
+                &mut self.numbers,
+                keep_pending,
                 ID_FIRST_MIN_EDIT,
                 vha_active,
                 cfg.first_min_threshold,
@@ -2316,19 +2347,22 @@ impl SettingsState {
             enable_number_row(
                 &mut self.disabled_labels,
                 self.switching_lbl,
-                &self.numbers,
+                &mut self.numbers,
+                keep_pending,
                 ID_SWITCHING_EDIT,
                 vha_active && cfg.vh_adjuster_method == VhAdjusterMethod::Switching,
                 cfg.switching_threshold,
             );
 
-            // Page 6: Excluded Programs
-            send_msg(self.excl_list, LB_RESETCONTENT, 0, 0);
-            for path in shared.store.exclusions().entries() {
-                let w = to_wide(path);
-                send_msg(self.excl_list, LB_ADDSTRING, 0, w.as_ptr() as isize);
+            // Page 6: Excluded Programs (not changed when nothing is loaded: the selection stays)
+            if read_lists {
+                send_msg(self.excl_list, LB_RESETCONTENT, 0, 0);
+                for path in shared.store.exclusions().entries() {
+                    let w = to_wide(path);
+                    send_msg(self.excl_list, LB_ADDSTRING, 0, w.as_ptr() as isize);
+                }
+                enable_window(self.excl_remove_btn, false);
             }
-            enable_window(self.excl_remove_btn, false);
 
             // Bottom status
             match shared.store.store_status() {
@@ -2354,8 +2388,10 @@ impl SettingsState {
         };
         self.set_note_kind(self.custom_status_lbl, custom_kind);
 
-        for nb in &mut self.numbers {
-            nb.dirty = false;
+        if !keep_pending {
+            for nb in &mut self.numbers {
+                nb.dirty = false;
+            }
         }
         self.refreshing = false;
         self.relayout_dynamic_controls();
@@ -3383,7 +3419,8 @@ fn get_check(hwnd: Handle) -> bool {
 fn enable_number_row(
     disabled_labels: &mut Vec<Handle>,
     lbl: Handle,
-    numbers: &[NumberBinding],
+    numbers: &mut [NumberBinding],
+    keep_pending: bool,
     edit_id: u16,
     enabled: bool,
     value: i32,
@@ -3391,12 +3428,19 @@ fn enable_number_row(
     if !enabled && !lbl.is_null() {
         disabled_labels.push(lbl);
     }
-    if let Some(nb) = numbers.iter().find(|n| n.edit_id == edit_id) {
+    if let Some(nb) = numbers.iter_mut().find(|n| n.edit_id == edit_id) {
         if !enabled {
             disabled_labels.push(nb.range_hwnd);
         }
         enable_window(nb.edit_hwnd, enabled);
         enable_window(nb.updown_hwnd, enabled);
+        // A number being typed (not stored yet) is kept (see refresh_values), unless its box is
+        // disabled: its text could not be corrected any more (its focus lost while refreshing,
+        // EN_KILLFOCUS not handled), and one out of range would never be stored nor dropped
+        if keep_pending && enabled && nb.dirty {
+            return;
+        }
+        nb.dirty = false;
         set_window_text(nb.edit_hwnd, &value.to_string());
         send_msg(nb.updown_hwnd, UDM_SETPOS32, 0, value as isize);
     }
