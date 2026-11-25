@@ -1755,6 +1755,18 @@ mod tests {
         assert_eq!(wide(&format!(r"\\?\C:\{long}")), format!("\\\\?\\C:\\{long}\0"));
     }
 
+    /// The path as usually written: `\\?\C:\…` as `C:\…`, `\\?\UNC\server\…` as `\\server\…`
+    fn plain_path(path: &Path) -> PathBuf {
+        let s = path.to_str().unwrap();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            PathBuf::from(format!(r"\\{rest}"))
+        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+            PathBuf::from(rest)
+        } else {
+            path.to_path_buf()
+        }
+    }
+
     #[test]
     fn write_replaces_a_file_under_a_long_path() -> io::Result<()> {
         // Deeper than MAX_PATH: std creates it, ReplaceFileW needs the `\\?\` prefix
@@ -1774,14 +1786,23 @@ mod tests {
         assert!(!temporary.exists());
 
         // The same file as a device path (`\\.\`), and through `..` (long, short once
-        // normalized): replaced, not left to the direct write
-        let device = PathBuf::from(format!(r"\\.\{}", path.display()));
-        fs::write(&temporary, "a=2\r\n")?;
-        replace_file(&temporary, &device, true)?;
-        assert_eq!(fs::read_to_string(&path)?, "a=2\r\n");
+        // normalized): replaced, not left to the direct write. Built from the directory as
+        // usually written: TMP may be verbatim (`\\?\`), before which `\\.\` cannot be put and
+        // where `..` is not resolved.
+        let plain = plain_path(&dir.0);
+        if plain.to_str().and_then(|s| s.get(1..3)) == Some(":\\") {
+            // As a string: join would replace `\\.\` by the absolute path
+            let device = PathBuf::from(format!(
+                r"\\.\{}",
+                plain.join(path.strip_prefix(&dir.0).unwrap()).display()
+            ));
+            fs::write(&temporary, "a=2\r\n")?;
+            replace_file(&temporary, &device, true)?;
+            assert_eq!(fs::read_to_string(&path)?, "a=2\r\n");
+        }
         let short = dir.0.join("short.properties");
         fs::write(&short, "b=0\r\n")?;
-        let mut detour = dir.0.clone();
+        let mut detour = plain;
         for _ in 0..60 {
             detour.push("x");
             detour.push("..");
