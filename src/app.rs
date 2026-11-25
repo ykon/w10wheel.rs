@@ -110,6 +110,12 @@ unsafe extern "system" {
     fn UnregisterSuspendResumeNotification(handle: Handle) -> i32;
 }
 
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetTickCount64() -> u64;
+    fn QueryUnbiasedInterruptTime(time: *mut u64) -> i32;
+}
+
 #[link(name = "wtsapi32")]
 unsafe extern "system" {
     fn WTSRegisterSessionNotification(hwnd: Handle, flags: u32) -> i32;
@@ -135,12 +141,71 @@ struct TrayHostState {
     suspend_resume_notification: Option<Handle>,
     session_notification: bool,
     session_notification_retries: u32,
-    // The input was reset at the lock, and at the suspend (see reset_input_at_loss), done before
-    // it was lost: the unlock and the resume keep it. Cleared then.
+    // The input was reset at the lock (see reset_input_at_loss), done before it was lost: the
+    // unlock keeps it. Cleared then.
     lock_reset: bool,
-    suspend_reset: bool,
-    // A resume was notified since the suspend (see resume_resets_input)
-    resume_seen: bool,
+    // Whether a resume is to reset the input (see SleepTracker)
+    sleep: SleepTracker,
+}
+
+/// Whether a resume is to reset the input: only if the system slept while the input was handled
+/// (the suspend missed: not notified, or its reset not taken in time, see reset_input_at_loss).
+/// After a suspend's reset all the input passes, and nothing is kept, until the resume
+/// (`passing`, see TriggerEngine::set_sleeping). A resume is not identified with its sleep, and
+/// it is notified once or twice (PBT_APMRESUMEAUTOMATIC, then PBT_APMRESUMESUSPEND when the user
+/// wakes the system, maybe much later), maybe late, after the passing was ended by hand: the time
+/// slept (sleep_ms) tells whether the system slept since the input was last known kept, at a
+/// resume or at the end by hand. A resume with none since resets nothing: the hooks have seen the
+/// input since, and a reset would forget what they saw (a trigger key passed meanwhile would be
+/// taken as a new press: its repeats would start scroll mode, and its up be suppressed, the key
+/// left pressed in the application).
+#[derive(Clone, Copy, Debug)]
+struct SleepTracker {
+    passing: bool,
+    // sleep_ms when the input was last known kept
+    slept_ms: u64,
+}
+
+// A sleep shorter is not told from the error of sleep_ms (the timer's resolution, 16 ms)
+const SLEPT_MIN_MS: u64 = 1_000;
+
+impl SleepTracker {
+    fn new(slept_ms: u64) -> Self {
+        Self {
+            passing: false,
+            slept_ms,
+        }
+    }
+
+    /// PBT_APMSUSPEND: whether its reset was taken (then all the input passes until the resume)
+    fn suspended(&mut self, reset_taken: bool) {
+        self.passing = reset_taken;
+    }
+
+    /// A resume: whether to reset the input (the system slept since it was last known kept, not
+    /// passing it)
+    fn resumed(&mut self, slept_ms: u64) -> bool {
+        let reset = !self.passing && slept_ms.saturating_sub(self.slept_ms) >= SLEPT_MIN_MS;
+        *self = Self::new(slept_ms);
+        reset
+    }
+
+    /// The passing ended by hand (Pass Mode, --sendInitState): the input is kept since
+    fn ended_by_hand(&mut self, slept_ms: u64) {
+        *self = Self::new(slept_ms);
+    }
+}
+
+/// The time the system has spent in sleep or hibernation since it started, in ms: the tick count
+/// counts it, the unbiased interrupt time (100 ns) does not
+fn sleep_ms() -> u64 {
+    let mut unbiased = 0;
+    let awake_ms = if unsafe { QueryUnbiasedInterruptTime(&mut unbiased) } != 0 {
+        unbiased / 10_000
+    } else {
+        0
+    };
+    unsafe { GetTickCount64() }.saturating_sub(awake_ms)
 }
 
 pub(crate) fn main() -> ExitCode {
@@ -366,8 +431,7 @@ fn run(options: LaunchOptions) -> ExitCode {
         session_notification: false,
         session_notification_retries: 0,
         lock_reset: false,
-        suspend_reset: false,
-        resume_seen: false,
+        sleep: SleepTracker::new(sleep_ms()),
     });
 
     if let Err(err) = sync_tray(tray_host, &mut host_state) {
@@ -476,14 +540,13 @@ unsafe extern "system" fn tray_wnd_proc(
             }
         }
         WM_POWERBROADCAST if wparam == PBT_APMSUSPEND => {
-            state.resume_seen = false;
-            state.suspend_reset = reset_input_at_loss(hwnd, state, true);
+            let taken = reset_input_at_loss(hwnd, state, true);
+            state.sleep.suspended(taken);
         }
         WM_POWERBROADCAST
             if wparam == PBT_APMRESUMEAUTOMATIC || wparam == PBT_APMRESUMESUSPEND =>
         {
-            let automatic = wparam == PBT_APMRESUMEAUTOMATIC;
-            let reset = resume_resets_input(&mut state.resume_seen, &mut state.suspend_reset, automatic);
+            let reset = state.sleep.resumed(sleep_ms());
             on_input_back(hwnd, state, reset, true);
             schedule_reinstall_hooks(hwnd, state);
         }
@@ -620,7 +683,7 @@ fn handle_ipc_command(hwnd: Handle, state: &mut TrayHostState, wparam: usize) {
 fn init_state(hwnd: Handle, state: &mut TrayHostState) {
     let _ = state.control.init_state();
     // It also ends the passing after a suspend, as set_paused
-    state.suspend_reset = false;
+    state.sleep.ended_by_hand(sleep_ms());
     let hw = unsafe { w::HWND::from_ptr(hwnd) };
     state.cursor.set_axis(&hw, None);
 }
@@ -655,23 +718,6 @@ fn on_input_back(hwnd: Handle, state: &mut TrayHostState, reset: bool, resume: b
         let hw = unsafe { w::HWND::from_ptr(hwnd) };
         state.cursor.set_axis(&hw, None);
     }
-}
-
-/// A resume is notified once or twice: PBT_APMRESUMEAUTOMATIC first, always, and
-/// PBT_APMRESUMESUSPEND after it when the user wakes the system, maybe much later: at the first
-/// input after an automatic resume. The input reset at the suspend is kept (`suspend_reset`, see
-/// reset_input_at_loss). If it was not (the suspend not notified, or its reset not done in time),
-/// it is reset at the first of them: at PBT_APMRESUMEAUTOMATIC, and at PBT_APMRESUMESUSPEND only if
-/// it came alone (none since the suspend). Not at the second: the hooks have seen the input since,
-/// and a reset would forget what they saw (a trigger key passed meanwhile would be taken as a new
-/// press: its repeats would start scroll mode, and its up be suppressed, the key left pressed in
-/// the application). The hooks are installed again after both (schedule_reinstall_hooks: from the
-/// last). `resume_seen` is set at a resume, cleared at the suspend; `suspend_reset` is cleared at
-/// the first resume.
-fn resume_resets_input(resume_seen: &mut bool, suspend_reset: &mut bool, automatic: bool) -> bool {
-    let first = automatic || !*resume_seen;
-    *resume_seen = true;
-    first && !std::mem::take(suspend_reset)
 }
 
 /// The keyboard hook could not be installed (at startup, at a load, or turned on in the dialog): the
@@ -714,8 +760,9 @@ fn handle_keyboard_hook_failed(state: &mut TrayHostState, wparam: usize, lparam:
 fn set_paused(hwnd: Handle, state: &mut TrayHostState, paused: bool) {
     let _ = state.control.set_paused(paused);
     // It also ends the passing after a suspend (TriggerEngine::set_paused), maybe for a resume
-    // missed: that suspend's reset is not kept for the next resume (the next suspend missed too)
-    state.suspend_reset = false;
+    // missed: the input is kept since (a resume of that sleep notified late resets nothing; one
+    // of another sleep, its suspend missed too, does)
+    state.sleep.ended_by_hand(sleep_ms());
     state.paused = paused;
     state.shared.borrow_mut().paused = paused;
     let hw = unsafe { w::HWND::from_ptr(hwnd) };
@@ -948,23 +995,35 @@ fn tray_menu(hwnd: Handle, lang: UiLanguage, paused: bool) -> w::AnyResult<Optio
 
 #[cfg(test)]
 mod tests {
-    use super::resume_resets_input;
+    use super::{SLEPT_MIN_MS, SleepTracker};
 
     #[test]
-    fn resume_resets_input_only_if_the_suspend_was_missed() {
-        // Reset at the suspend: kept at both resumes
-        let (mut seen, mut reset) = (false, true);
-        assert!(!resume_resets_input(&mut seen, &mut reset, true));
-        assert!(!resume_resets_input(&mut seen, &mut reset, false));
-        // The next suspend not notified: reset at the automatic resume only
-        assert!(resume_resets_input(&mut seen, &mut reset, true));
-        assert!(!resume_resets_input(&mut seen, &mut reset, false));
-        // The suspend's reset not done in time, the user's resume alone: reset
-        let (mut seen, mut reset) = (false, false);
-        assert!(resume_resets_input(&mut seen, &mut reset, false));
-        assert!(!resume_resets_input(&mut seen, &mut reset, false));
-        // Reset at the suspend, the user's resume alone: kept
-        let (mut seen, mut reset) = (false, true);
-        assert!(!resume_resets_input(&mut seen, &mut reset, false));
+    fn a_resume_resets_the_input_only_if_the_system_slept_handling_it() {
+        let slept = |n: u64| n * SLEPT_MIN_MS;
+        let mut sleep = SleepTracker::new(0);
+        // Reset at the suspend (passing): kept at both resumes
+        sleep.suspended(true);
+        assert!(!sleep.resumed(slept(5)));
+        assert!(!sleep.resumed(slept(5)));
+        // The next suspend not notified: reset at the first resume only
+        assert!(sleep.resumed(slept(9)));
+        assert!(!sleep.resumed(slept(9)));
+        // The suspend's reset not taken in time: reset
+        sleep.suspended(false);
+        assert!(sleep.resumed(slept(12)));
+        // No sleep, within the error of the time slept: kept
+        assert!(!sleep.resumed(slept(12) + SLEPT_MIN_MS - 1));
+
+        // The resume missed, the passing ended by hand: a resume of that sleep notified late
+        // keeps the input (pressed since)...
+        let mut sleep = SleepTracker::new(0);
+        sleep.suspended(true);
+        sleep.ended_by_hand(slept(3));
+        assert!(!sleep.resumed(slept(3)));
+        // ...and one of another sleep, its suspend missed, resets it
+        let mut sleep = SleepTracker::new(0);
+        sleep.suspended(true);
+        sleep.ended_by_hand(slept(3));
+        assert!(sleep.resumed(slept(7)));
     }
 }
