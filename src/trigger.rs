@@ -187,11 +187,20 @@ impl ButtonTracker {
         }
     }
 
-    /// The buttons' ups may have been missed (no hook saw them): the suppressed downs are
-    /// forgotten, so the up of a press made meanwhile (which reached the application) is not
-    /// suppressed as theirs. The press ids are kept (resent events in flight are still told).
-    fn forget_suppressed(&mut self) {
+    /// The buttons' ups may have been missed (no hook saw them; the physical up reached the
+    /// application then). The suppressed downs are forgotten, so the up of a press made meanwhile
+    /// (which reached the application too) is not suppressed as theirs. A resent down still
+    /// queued for a press whose release was not queued is dropped when it comes (as after a
+    /// passed up), or it would reach the application alone and the button stay down; one whose
+    /// release is queued passes with it (the click is whole). The press ids are kept (resent
+    /// events in flight are still told).
+    fn forget_presses(&mut self) {
         self.down_suppressed = [false; MouseButton::COUNT];
+        for i in 0..MouseButton::COUNT {
+            if self.release_queued_id[i] != self.press_id[i] {
+                self.up_passed[i] = true;
+            }
+        }
     }
 
     fn mark_release_queued(&mut self, button: MouseButton, press_id: u32) {
@@ -276,16 +285,8 @@ impl KeyFlags {
         self.last_key_event = None;
     }
 
-    /// Windows had removed the old keyboard hook: a key may have been released and pressed again
-    /// with no hook to see it (its down reached the application). The records that would suppress
-    /// its repeats or its up are forgotten; the passed keys are kept (they pass anyway).
-    fn forget_suppressed(&mut self) {
-        self.kd_suppressed = [false; KEY_COUNT];
-        self.kd_lone_up = [false; KEY_COUNT];
-        self.last_key_event = None;
-    }
-
-    /// The keyboard hook is removed: the ups will not be seen
+    /// The keyboard hook is removed, or keys were not seen (the old hook lost, the session locked):
+    /// the ups will not be seen, or were missed
     fn reset(&mut self) {
         *self = Self::default();
     }
@@ -1004,16 +1005,12 @@ impl TriggerEngine {
         self.last_mouse_event = None;
     }
 
-    /// The keyboard hook has been replaced, and Windows had removed the old one (e.g. for a
-    /// timeout): keys may have been released and pressed again with no hook to see them. As .NET
-    /// (KEventHandler.hookInstalled), the suppressed keys are forgotten, and the scroll mode the
-    /// trigger key started (which would not end) is ended. A hook replaced while the old one was
-    /// still installed missed nothing: nothing is changed then (a scroll in progress goes on).
     /// The mouse hook has been replaced, and Windows had removed the old one (e.g. for a
     /// timeout): buttons may have been released with no hook to see it, and a scroll mode they
-    /// started would not end (the moves suppressed). The mouse triggers' records are reset and
-    /// that scroll mode is ended (a keyboard one goes on). A hook replaced while the old one was
-    /// still installed missed nothing: nothing is changed then.
+    /// started would not end (the moves suppressed). The mouse triggers' records are reset (see
+    /// ButtonTracker::forget_presses) and that scroll mode is ended (a keyboard one goes on). A
+    /// hook replaced while the old one was still installed missed nothing: nothing is changed
+    /// then.
     pub fn on_mouse_hook_lost(&mut self, host: &mut impl TriggerHost) {
         if self.lr_wait.take().is_some() {
             host.kill_poll_timer();
@@ -1022,25 +1019,31 @@ impl TriggerEngine {
             self.exit_scroll(host);
         }
         self.last_flags.reset();
-        self.tracker.forget_suppressed();
+        self.tracker.forget_presses();
         self.last_mouse_event = None;
+    }
+
+    /// The keyboard hook has been replaced, and Windows had removed the old one (e.g. for a
+    /// timeout): keys may have been released and pressed again with no hook to see them. All the
+    /// keys' records are forgotten (also those of the passed keys: one passed over an excluded
+    /// window and released meanwhile would pass its next press), and the scroll mode the trigger
+    /// key started (which would not end) is ended. A hook replaced while the old one was still
+    /// installed missed nothing: nothing is changed then (a scroll in progress goes on).
+    pub fn on_keyboard_hook_lost(&mut self, host: &mut impl TriggerHost) {
+        self.key_flags.reset();
+        if self.is_keyboard_scroll() {
+            self.exit_scroll(host);
+        }
     }
 
     /// The session was locked or unlocked, or the system suspended or resumed: the hooks saw none
     /// of the input meanwhile (it went to the secure desktop, or was lost). As init_state, and the
-    /// records of all keys and buttons are forgotten: none is still held from before (a key passed
-    /// over an excluded window and released meanwhile would pass its next press).
+    /// records of all keys and buttons are forgotten as when the hooks were lost: none is still
+    /// held from before.
     pub fn on_input_lost(&mut self, host: &mut impl TriggerHost) {
         self.init_state(host);
-        self.tracker.forget_suppressed();
+        self.tracker.forget_presses();
         self.key_flags.reset();
-    }
-
-    pub fn on_keyboard_hook_lost(&mut self, host: &mut impl TriggerHost) {
-        self.key_flags.forget_suppressed();
-        if self.is_keyboard_scroll() {
-            self.exit_scroll(host);
-        }
     }
 
     /// The keyboard hook has been removed (keyboard trigger off, or it could not be installed):
@@ -1998,6 +2001,92 @@ mod tests {
         kb.handle_key(key(TriggerKey::VkLmenu.vk_code(), KeyAction::Down, 10), &mut host);
         assert!(kb.is_scrolling());
         kb.on_mouse_hook_lost(&mut host);
+        assert!(kb.is_scrolling());
+    }
+
+    #[test]
+    fn lost_mouse_hook_drops_queued_resent_down_without_its_release() {
+        // LR: the wait timed out and the down was queued to be resent; then the hook was lost and
+        // its physical up missed (it reached the application). The resent down, sent after the
+        // recovery, must not reach the application alone (the button would stay down).
+        let (mut engine, _tags, mut host) = base_engine(Trigger::Lr);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 50, 60, 100), &mut host);
+        host.take_calls();
+        engine.on_poll_timeout(&mut host);
+        let down_extra = match host.take_calls().as_slice() {
+            [HostCall::KillTimer, HostCall::Down(MouseButton::Left, _, extra)] => *extra,
+            other => panic!("unexpected timeout calls: {other:?}"),
+        };
+        engine.on_mouse_hook_lost(&mut host);
+        assert_eq!(
+            engine.handle_mouse(
+                inj_mouse(HookMouseKind::Down(MouseButton::Left), 50, 60, 400, down_extra),
+                &mut host
+            ),
+            HookDecision::Suppress
+        );
+        // The next press works as before.
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 50, 60, 900), &mut host),
+            HookDecision::Suppress
+        );
+        assert_eq!(host.take_calls(), vec![HostCall::SetTimer(200)]);
+
+        // Its physical up came before the loss (the release queued too): the click is whole, both
+        // pass after the recovery.
+        let (mut engine, _tags, mut host) = base_engine(Trigger::Lr);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 50, 60, 100), &mut host);
+        host.take_calls();
+        engine.on_poll_timeout(&mut host);
+        let down_extra = match host.take_calls().as_slice() {
+            [HostCall::KillTimer, HostCall::Down(MouseButton::Left, _, extra)] => *extra,
+            other => panic!("unexpected timeout calls: {other:?}"),
+        };
+        engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Left), 50, 60, 310), &mut host);
+        let rel_extra = match host.take_calls().as_slice() {
+            [HostCall::Up(MouseButton::Left, _, extra)] => *extra,
+            other => panic!("unexpected release calls: {other:?}"),
+        };
+        engine.on_mouse_hook_lost(&mut host);
+        assert_eq!(
+            engine.handle_mouse(
+                inj_mouse(HookMouseKind::Down(MouseButton::Left), 50, 60, 400, down_extra),
+                &mut host
+            ),
+            HookDecision::Pass
+        );
+        assert_eq!(
+            engine.handle_mouse(
+                inj_mouse(HookMouseKind::Up(MouseButton::Left), 50, 60, 410, rel_extra),
+                &mut host
+            ),
+            HookDecision::Pass
+        );
+    }
+
+    #[test]
+    fn lost_keyboard_hook_forgets_passed_keys() {
+        use crate::exclusions::ExclusionList;
+
+        // The trigger key passed over an excluded window, released with no hook: after the
+        // recovery, its first press starts the scroll.
+        let excluded_pt = Point { x: 100, y: 100 };
+        let mut cfg = Config::default();
+        cfg.keyboard_hook = true;
+        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let matcher = ExclusionList::from_lines(["C:\\Games\\game.exe"]).to_matcher();
+        let mut kb = TriggerEngine::new(
+            EngineConfig::from_config(&cfg, &CustomTableState::default()).with_exclusions(matcher),
+            ResendTags::next_unique(),
+        );
+        let mut host = MockHost::new();
+        host.excluded_points.push(excluded_pt);
+        let vk = TriggerKey::VkLmenu.vk_code();
+        host.cursor = excluded_pt;
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 10), &mut host), HookDecision::Pass);
+        kb.on_keyboard_hook_lost(&mut host);
+        host.cursor = Point { x: 20, y: 20 };
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 500), &mut host), HookDecision::Suppress);
         assert!(kb.is_scrolling());
     }
 
