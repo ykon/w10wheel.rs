@@ -121,9 +121,40 @@ unsafe extern "system" {
 
 const REPLACEFILE_IGNORE_MERGE_ERRORS: u32 = 0x0000_0002;
 
+/// Paths of this length (in UTF-16 units) or longer are given the `\\?\` prefix, as std does for
+/// its own calls (MAX_PATH less the 12 units that a directory must leave for a 8.3 file name)
+const LEGACY_MAX_PATH: usize = 248;
+
+/// The path for a Win32 function called directly (std's own functions do this themselves): a
+/// long one is made absolute and given the `\\?\` prefix (`\\?\UNC\` for a share), as .NET does
+/// (File.Replace). Without it, such a function fails for a long path (ERROR_PATH_NOT_FOUND)
+/// unless long paths are enabled for both the system and the process. A short one is passed as
+/// it is.
 fn wide_path(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
-    path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    const SEP: u16 = b'\\' as u16;
+    const QUESTION: u16 = b'?' as u16;
+    const DOT: u16 = b'.' as u16;
+    const COLON: u16 = b':' as u16;
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.len() >= LEGACY_MAX_PATH {
+        // Normalized as Windows would (GetFullPathNameW): `\\?\` turns that off
+        if let Ok(absolute) = std::path::absolute(path) {
+            wide = absolute.as_os_str().encode_wide().collect();
+        }
+        let prefixed = |prefix: &str, rest: &[u16]| -> Vec<u16> {
+            prefix.encode_utf16().chain(rest.iter().copied()).collect()
+        };
+        wide = match wide.as_slice() {
+            // Already verbatim, or a device path (`\\.\`)
+            [SEP, SEP, QUESTION | DOT, SEP, ..] => wide,
+            [SEP, SEP, rest @ ..] => prefixed(r"\\?\UNC\", rest),
+            [_, COLON, SEP, ..] => prefixed(r"\\?\", &wide),
+            _ => wide,
+        };
+    }
+    wide.push(0);
+    wide
 }
 
 /// The existing file replaced by the temporary one with ReplaceFile, as .NET File.Replace does: its
@@ -1618,6 +1649,40 @@ mod tests {
         if unsafe { SetFileAttributesW(wide_path(path).as_ptr(), attributes) } == 0 {
             return Err(io::Error::last_os_error());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn wide_path_prefixes_long_paths_only() {
+        let wide = |p: &str| String::from_utf16(&wide_path(Path::new(p))).unwrap();
+        assert_eq!(wide(r"C:\a\b.properties"), "C:\\a\\b.properties\0");
+        let long = "x".repeat(300);
+        assert_eq!(wide(&format!(r"C:\{long}")), format!("\\\\?\\C:\\{long}\0"));
+        assert_eq!(wide(&format!(r"C:\a\..\{long}")), format!("\\\\?\\C:\\{long}\0"));
+        assert_eq!(
+            wide(&format!(r"\\server\share\{long}")),
+            format!("\\\\?\\UNC\\server\\share\\{long}\0")
+        );
+        assert_eq!(wide(&format!(r"\\?\C:\{long}")), format!("\\\\?\\C:\\{long}\0"));
+    }
+
+    #[test]
+    fn write_replaces_a_file_under_a_long_path() -> io::Result<()> {
+        // Deeper than MAX_PATH: std creates it, ReplaceFileW needs the `\\?\` prefix
+        let dir = TestDir::new()?;
+        let mut deep = dir.0.clone();
+        for idx in 0..6 {
+            deep.push(format!("{idx}-{}", "d".repeat(50)));
+        }
+        fs::create_dir_all(&deep)?;
+        let path = deep.join("long.properties");
+        assert!(path.as_os_str().len() > 300);
+        fs::write(&path, "a=0\r\n")?;
+        let temporary = deep.join("long.properties.tmp");
+        fs::write(&temporary, "a=1\r\n")?;
+        replace_file(&temporary, &path, true)?;
+        assert_eq!(fs::read_to_string(&path)?, "a=1\r\n");
+        assert!(!temporary.exists());
         Ok(())
     }
 
