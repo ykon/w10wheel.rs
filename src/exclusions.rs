@@ -462,10 +462,11 @@ mod tests {
 
         ExclusionsFile::write(&link, &ExclusionList::new())?;
         assert!(fs::symlink_metadata(&link)?.file_type().is_symlink());
+        // Emptied, its encoding kept: the BOM alone (no line, so no newline to keep)
+        assert_eq!(fs::read(&target)?, [0xEF, 0xBB, 0xBF]);
         let target_raw = TextFile::read(&target)?;
         assert!(target_raw.lines.is_empty());
         assert_eq!(target_raw.encoding, TextEncoding::Utf8 { bom: true });
-        assert_eq!(target_raw.newline, "\n");
         Ok(())
     }
 
