@@ -598,9 +598,12 @@ pub fn validate_new_profile_name(dir: &Path, name: &str) -> Result<(), ProfileNa
 /// The properties file of new properties (ConfigStore::add_profile), held open from its creation
 /// until the Add is done. Created only if there is none (create_new): a file made there by another
 /// program since the name was checked is not replaced (an AlreadyExists error), as .NET File.Copy
-/// fails. Written whole at once with its final contents, through this handle, which shares only
-/// reading: while it is held, no other program can write, replace, rename or delete the file. So
-/// the file written, and the one deleted if the Add fails (discard), is always this one.
+/// fails. Written whole at once with its final contents, through this handle, which shares nothing:
+/// while it is held, no other program can open the file at all, so none can write, replace, rename
+/// or delete it, and the file written, and the one deleted if the Add fails (discard), is always
+/// this one. Not even reading is shared (nothing needs it: the Add loads what it wrote from
+/// memory): a program reading it could map it into memory, and Windows does not delete a file
+/// mapped so, which would leave the file of a failed Add behind, its name taken.
 struct NewProfileFile {
     file: fs::File,
 }
@@ -613,7 +616,7 @@ impl NewProfileFile {
             // write: needed by OpenOptions for create_new (the access is access_mode)
             .write(true)
             .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE_ACCESS)
-            .share_mode(FILE_SHARE_READ)
+            .share_mode(0)
             .create_new(true)
             .open(path)?;
         let mut new = Self { file };
@@ -659,7 +662,6 @@ unsafe extern "system" {
 const DELETE_ACCESS: u32 = 0x0001_0000;
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
-const FILE_SHARE_READ: u32 = 0x0000_0001;
 const FILE_DISPOSITION_INFO_CLASS: u32 = 4;
 
 pub fn delete_profile(dir: &Path, name: &str) -> io::Result<()> {
@@ -1752,9 +1754,10 @@ mod tests {
         let mine = b"# mine\r\nreverseScroll=true\r\n";
         let new_file = NewProfileFile::create(&path, mine)?;
 
-        // While held, another program can read it, but not replace it (also with the same
-        // contents: another file), write into it, rename it or delete it
-        assert_eq!(fs::read(&path)?, mine);
+        // While held, no other program can open it: not even to read it (and map it into memory,
+        // which would keep Windows from deleting it), nor replace it (also with the same contents:
+        // another file), write into it, rename it or delete it
+        assert!(fs::read(&path).is_err());
         let other = dir.0.join("other.properties");
         fs::write(&other, mine)?;
         assert!(fs::rename(&other, &path).is_err());
@@ -1762,7 +1765,7 @@ mod tests {
         assert!(OpenOptions::new().write(true).open(&path).is_err());
         assert!(fs::rename(&path, dir.0.join("moved.properties")).is_err());
         assert!(fs::remove_file(&path).is_err());
-        assert_eq!(fs::read(&path)?, mine);
+        assert!(path.is_file());
 
         // The Add failed: this file is deleted (nothing else can be at its path)
         new_file.discard()?;
