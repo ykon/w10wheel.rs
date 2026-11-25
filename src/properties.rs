@@ -417,13 +417,19 @@ impl PropertiesFile {
     }
 
     pub fn store_map(path: &Path, map: &BTreeMap<String, String>) -> io::Result<()> {
+        Self::store_map_written(path, map).map(drop)
+    }
+
+    /// As store_map, returning the bytes written
+    fn store_map_written(path: &Path, map: &BTreeMap<String, String>) -> io::Result<Vec<u8>> {
         let lines = map.iter().map(|(k, v)| format!("{k}={v}")).collect();
         let file = TextFile {
             lines,
             newline: "\r\n".to_owned(),
             encoding: TextEncoding::Utf8 { bom: false },
         };
-        TextFile::write(path, &file)
+        TextFile::write(path, &file)?;
+        Ok(file.to_bytes())
     }
 
     /// Updates only `keys` in `path`, preserving existing comments, formatting, line endings,
@@ -433,6 +439,15 @@ impl PropertiesFile {
         values: &BTreeMap<String, String>,
         keys: &[String],
     ) -> io::Result<()> {
+        Self::update_keys_written(path, values, keys).map(drop)
+    }
+
+    /// As update_keys, returning the bytes written
+    fn update_keys_written(
+        path: &Path,
+        values: &BTreeMap<String, String>,
+        keys: &[String],
+    ) -> io::Result<Vec<u8>> {
         let file = TextFile::read(path)?;
         let to_write: HashSet<&str> = keys.iter().map(String::as_str).collect();
         let mut written: HashSet<String> = HashSet::new();
@@ -470,7 +485,8 @@ impl PropertiesFile {
             newline: file.newline,
             encoding: file.encoding,
         };
-        TextFile::write(path, &updated)
+        TextFile::write(path, &updated)?;
+        Ok(updated.to_bytes())
     }
 }
 
@@ -586,18 +602,18 @@ pub fn validate_new_profile_name(dir: &Path, name: &str) -> Result<(), ProfileNa
 /// The properties file of new properties made at `dest`, only if there is none (create_new): the
 /// name is reserved at once, so a file made there by another program since the name was checked is
 /// not replaced (an AlreadyExists error), as .NET File.Copy fails. It has the contents of `src` if
-/// that exists (its comments, its other keys; not its attributes, e.g. read-only): true then, else
-/// it is empty (false). Removed again if the copy fails.
-fn create_profile_file(src: &Path, dest: &Path) -> io::Result<bool> {
+/// that exists (its comments, its other keys; not its attributes, e.g. read-only): its bytes then,
+/// else it is empty (None). Removed again if the copy fails.
+fn create_profile_file(src: &Path, dest: &Path) -> io::Result<Option<Vec<u8>>> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(dest)?;
-    let copied = (|| -> io::Result<bool> {
+    let copied = (|| -> io::Result<Option<Vec<u8>>> {
         match fs::read(src) {
             Ok(bytes) => {
                 file.write_all(&bytes)?;
                 file.sync_all()?;
-                Ok(true)
+                Ok(Some(bytes))
             }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err),
         }
     })();
@@ -606,6 +622,54 @@ fn create_profile_file(src: &Path, dest: &Path) -> io::Result<bool> {
         let _ = fs::remove_file(dest);
     }
     copied
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn SetFileInformationByHandle(
+        file: std::os::windows::io::RawHandle,
+        class: u32,
+        info: *const std::ffi::c_void,
+        size: u32,
+    ) -> i32;
+}
+
+const DELETE_ACCESS: u32 = 0x0001_0000;
+const GENERIC_READ: u32 = 0x8000_0000;
+const FILE_DISPOSITION_INFO_CLASS: u32 = 4;
+
+/// Deletes `path` only if it still has exactly `contents`: the file written by this process, not
+/// one that another program has put there since (true if deleted). The file is opened for itself
+/// (no sharing) to read and delete it, so it cannot be replaced in between; a file that cannot be
+/// opened so (e.g. open in another program) is not deleted.
+fn delete_if_contents(path: &Path, contents: &[u8]) -> io::Result<bool> {
+    use std::io::Read;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    let mut file = OpenOptions::new()
+        .access_mode(GENERIC_READ | DELETE_ACCESS)
+        .share_mode(0)
+        .open(path)?;
+    let mut current = Vec::with_capacity(contents.len());
+    file.read_to_end(&mut current)?;
+    if current != contents {
+        return Ok(false);
+    }
+    // FILE_DISPOSITION_INFO { DeleteFile: TRUE }: deleted when this handle is closed
+    let delete: u8 = 1;
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FILE_DISPOSITION_INFO_CLASS,
+            (&raw const delete).cast(),
+            size_of::<u8>() as u32,
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(true)
 }
 
 pub fn delete_profile(dir: &Path, name: &str) -> io::Result<()> {
@@ -984,7 +1048,8 @@ impl ConfigStore {
         let all_keys: Vec<String> = current.keys().cloned().collect();
 
         let lang = self.lang();
-        let mut made_prop = false;
+        // The contents of the properties file as this Add last wrote them (None: not made)
+        let mut written: Option<Vec<u8>> = None;
         let write_result = (|| -> io::Result<()> {
             // Made by another program since the name was checked: not replaced (its contents
             // would be lost), the Add fails as for a name that exists
@@ -1001,12 +1066,13 @@ impl ConfigStore {
                     err
                 }
             })?;
-            made_prop = true;
-            if copied {
-                PropertiesFile::update_keys(&dest_path, &current, &all_keys)?;
+            // As made (the copy, or empty), until the settings are written into it
+            written = Some(copied.clone().unwrap_or_default());
+            written = Some(if copied.is_some() {
+                PropertiesFile::update_keys_written(&dest_path, &current, &all_keys)?
             } else {
-                PropertiesFile::store_map(&dest_path, &current)?;
-            }
+                PropertiesFile::store_map_written(&dest_path, &current)?
+            });
             // The excluded programs running, always, as .NET (Ctx.addProperties): an exclusions
             // file of this name without its properties is a leftover of earlier properties (e.g.
             // deleted while the file was locked, see delete_profile, or outside W10Wheel). It is
@@ -1018,9 +1084,11 @@ impl ConfigStore {
 
         if let Err(err) = write_result {
             // Not left half made: the properties file made by this Add is deleted, they can be
-            // added again
-            if made_prop {
-                let _ = fs::remove_file(&dest_path);
+            // added again. Only if it is still the one this Add wrote: a file another program has
+            // put there since (e.g. while the excluded programs were written) is kept. (.NET
+            // deletes the path whatever is there.)
+            if let Some(contents) = written {
+                let _ = delete_if_contents(&dest_path, &contents);
             }
             return Err(err);
         }
@@ -1695,11 +1763,47 @@ mod tests {
 
         // Free: a copy of the source (its comments too), or empty without one
         let free = profile_path(&dir.0, "Home");
-        assert!(create_profile_file(&src, &free)?);
+        assert_eq!(
+            create_profile_file(&src, &free)?.as_deref(),
+            Some("# mine\r\nreverseScroll=true\r\n".as_bytes())
+        );
         assert_eq!(fs::read_to_string(&free)?, "# mine\r\nreverseScroll=true\r\n");
         let empty = profile_path(&dir.0, "Empty");
-        assert!(!create_profile_file(&dir.0.join("missing.properties"), &empty)?);
+        assert!(create_profile_file(&dir.0.join("missing.properties"), &empty)?.is_none());
         assert_eq!(fs::read(&empty)?.len(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_add_deletes_only_the_properties_file_it_wrote() -> io::Result<()> {
+        let dir = TestDir::new()?;
+        let mut map = BTreeMap::new();
+        map.insert("a".to_owned(), "1".to_owned());
+
+        // The bytes reported are those on the disk (the file is recognized as this Add's)
+        let path = dir.0.join("mine.properties");
+        let written = PropertiesFile::store_map_written(&path, &map)?;
+        assert_eq!(fs::read(&path)?, written);
+        map.insert("b".to_owned(), "2".to_owned());
+        let keys = vec!["b".to_owned()];
+        let updated = PropertiesFile::update_keys_written(&path, &map, &keys)?;
+        assert_eq!(fs::read(&path)?, updated);
+        assert!(delete_if_contents(&path, &updated)?);
+        assert!(!path.exists());
+
+        // Replaced by another program meanwhile: kept
+        let theirs = dir.0.join("theirs.properties");
+        let mine = PropertiesFile::store_map_written(&theirs, &map)?;
+        fs::write(&theirs, "# made by another program\r\n")?;
+        assert!(!delete_if_contents(&theirs, &mine)?);
+        assert_eq!(fs::read_to_string(&theirs)?, "# made by another program\r\n");
+
+        // Open in another program (cannot be opened for itself): not deleted either
+        fs::write(&theirs, &mine)?;
+        let open = OpenOptions::new().read(true).share_mode(0x1).open(&theirs)?;
+        assert!(delete_if_contents(&theirs, &mine).is_err());
+        drop(open);
+        assert!(theirs.exists());
         Ok(())
     }
 
