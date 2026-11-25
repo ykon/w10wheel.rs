@@ -265,8 +265,22 @@ struct KeyFlags {
     // The time of the last down of each key (its repeats too): what was seen of it since a time
     // is kept by a reset (see since)
     kd_time: [u32; KEY_COUNT],
+    // The trigger key whose scroll a reset ended, maybe still held (see on_input_lost)
+    ended_scroll: Option<EndedScroll>,
     last_key_event: Option<(u32, KeyAction)>,
 }
+
+/// The scroll of the trigger key `vk` pressed at `started_at`, ended by a reset sent at `at`
+#[derive(Clone, Copy, Debug)]
+struct EndedScroll {
+    vk: usize,
+    started_at: u32,
+    at: u32,
+}
+
+/// A held key repeats within this time of a reset: its first repeat comes at most the repeat delay
+/// after its down (1 s at most), before the reset. A down later is a new press.
+const ENDED_SCROLL_REPEAT_MS: u32 = 1000;
 
 impl Default for KeyFlags {
     fn default() -> Self {
@@ -275,6 +289,7 @@ impl Default for KeyFlags {
             kd_passed: [false; KEY_COUNT],
             kd_lone_up: [false; KEY_COUNT],
             kd_time: [0; KEY_COUNT],
+            ended_scroll: None,
             last_key_event: None,
         }
     }
@@ -288,7 +303,16 @@ impl KeyFlags {
                 self.kd_lone_up[vk] = true;
             }
         }
+        self.ended_scroll = None;
         self.last_key_event = None;
+    }
+
+    /// The start of the scroll a reset ended, if this down of its key (at `time`) may be a repeat
+    /// of its press: the scroll is resumed from there (cleared at any down or up of the key)
+    fn take_ended_scroll(&mut self, vk: usize, time: u32) -> Option<u32> {
+        let ended = self.ended_scroll.filter(|e| e.vk == vk)?;
+        self.ended_scroll = None;
+        (time.wrapping_sub(ended.at) as i32 <= ENDED_SCROLL_REPEAT_MS as i32).then_some(ended.started_at)
     }
 
     /// The keyboard hook is removed, or keys were not seen (the session locked): the ups will not
@@ -851,6 +875,7 @@ impl TriggerEngine {
         match event.action {
             KeyAction::Down => {
                 self.key_flags.kd_time[vk] = event.time;
+                let resumed_at = self.key_flags.take_ended_scroll(vk, event.time);
                 if event.vk_code == VK_PAUSE && is_trigger_key && self.key_flags.kd_suppressed[vk] {
                     self.key_flags.kd_suppressed[vk] = false;
                     self.key_flags.last_key_event = Some((event.vk_code, KeyAction::Up));
@@ -899,7 +924,7 @@ impl TriggerEngine {
                     }
                     let scroll = ActiveScroll::new_immediate(
                         ScrollOwner::Keyboard,
-                        event.time,
+                        resumed_at.unwrap_or(event.time),
                         &self.config.scroll,
                     );
                     if !self.start_scroll(scroll, host) {
@@ -925,6 +950,9 @@ impl TriggerEngine {
                 true
             }
             KeyAction::Up => {
+                if self.key_flags.ended_scroll.is_some_and(|e| e.vk == vk) {
+                    self.key_flags.ended_scroll = None;
+                }
                 if self.key_flags.kd_suppressed[vk] {
                     self.key_flags.kd_suppressed[vk] = false;
                     if is_trigger_key {
@@ -1116,6 +1144,10 @@ impl TriggerEngine {
     /// its repeats would start a scroll again, and its up, within the lock time of that repeat,
     /// leave it on). A key passed just before (the notification is handled a little after the
     /// event) passes on, its records forgotten (see handle_key_inner, a key down already).
+    /// The scroll of the trigger key pressed just before is ended, as one from before the lock
+    /// (the key released then, unseen), but resumed from its press at a repeat (EndedScroll):
+    /// its up, which would be suppressed alone, ends it then. Its up before is suppressed (as its
+    /// down was).
     /// The mouse's records are all reset.
     pub fn on_input_lost(&mut self, at: u32, host: &mut impl TriggerHost) {
         let keys = self.key_flags.since(at);
@@ -1124,6 +1156,20 @@ impl TriggerEngine {
                 .scroll
                 .as_ref()
                 .is_some_and(|s| is_at_or_after(s.started_at, at));
+        let trigger = self.config.trigger.target_vk_code.vk_code();
+        let ended_scroll = self
+            .scroll
+            .as_ref()
+            .filter(|s| !keyboard_scroll_since && !s.released && s.owner == ScrollOwner::Keyboard)
+            .filter(|_| trigger != VK_PAUSE)
+            .and_then(|s| {
+                let vk = usize::try_from(trigger).ok().filter(|&vk| vk < KEY_COUNT)?;
+                Some(EndedScroll {
+                    vk,
+                    started_at: s.started_at,
+                    at,
+                })
+            });
         if keyboard_scroll_since {
             // As init_state, but for the scroll and the keys
             if self.lr_wait.take().is_some() {
@@ -1140,6 +1186,10 @@ impl TriggerEngine {
         }
         self.tracker.forget_presses();
         self.key_flags = keys;
+        if let Some(ended) = ended_scroll {
+            self.key_flags.kd_lone_up[ended.vk] = true;
+            self.key_flags.ended_scroll = Some(ended);
+        }
     }
 
     /// The keyboard hook has been removed (keyboard trigger off, or it could not be installed):
@@ -2351,11 +2401,35 @@ mod tests {
         assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 1520), &mut host), HookDecision::Suppress);
         assert!(!kb.is_scrolling());
 
-        // Pressed before it was sent: forgotten, its scroll ended (as before)
+        // Pressed before it was sent (the GUI handled the notification after the press): its
+        // scroll is ended, and resumed from the press at its next down. A repeat (the key held):
+        // the scroll ends at the up 520 ms after the press.
         kb.handle_key(key(vk, KeyAction::Down, 2000), &mut host);
         assert!(kb.is_scrolling());
         kb.on_input_lost(2010, &mut host);
         assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 2500), &mut host), HookDecision::Suppress);
+        assert!(kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 2520), &mut host), HookDecision::Suppress);
+        assert!(!kb.is_scrolling());
+
+        // Released when it was not seen (before the lock): its next press, later, is a new one
+        // (tapped: its scroll goes on, released)
+        kb.handle_key(key(vk, KeyAction::Down, 3000), &mut host);
+        kb.on_input_lost(3010, &mut host);
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 9000), &mut host), HookDecision::Suppress);
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 9100), &mut host), HookDecision::Suppress);
+        assert!(kb.is_scrolling());
+        kb.init_state(&mut host);
+
+        // Released before its first repeat: its up is suppressed (as its down was), no scroll
+        kb.handle_key(key(vk, KeyAction::Down, 10000), &mut host);
+        kb.on_input_lost(10010, &mut host);
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 10100), &mut host), HookDecision::Suppress);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 10200), &mut host), HookDecision::Suppress);
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 10300), &mut host), HookDecision::Suppress);
+        assert!(kb.is_scrolling());
     }
 
     #[test]
