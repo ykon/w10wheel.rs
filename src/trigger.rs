@@ -363,8 +363,6 @@ pub struct TriggerEngine {
     config: EngineConfig,
     tags: ResendTags,
     paused: bool,
-    // From the reset at a suspend to the resume: all the input passes (see set_sleeping)
-    sleeping: bool,
     generation: u64,
     tracker: ButtonTracker,
     last_flags: LastFlags,
@@ -381,7 +379,6 @@ impl TriggerEngine {
             config,
             tags,
             paused: false,
-            sleeping: false,
             generation: 0,
             tracker: ButtonTracker::default(),
             last_flags: LastFlags::default(),
@@ -399,11 +396,6 @@ impl TriggerEngine {
 
     pub fn is_scrolling(&self) -> bool {
         self.scroll.is_some()
-    }
-
-    /// Paused, or sleeping (see set_sleeping): all the input passes, no trigger works
-    fn passes_all(&self) -> bool {
-        self.paused || self.sleeping
     }
 
     /// Whether the keyboard hook is to be installed: the keyboard trigger is on, and not paused
@@ -430,7 +422,7 @@ impl TriggerEngine {
     }
 
     fn handle_mouse_move(&mut self, event: HookMouseEvent, host: &mut impl TriggerHost) -> bool {
-        if self.passes_all() {
+        if self.paused {
             return true;
         }
         if !event.injected {
@@ -498,7 +490,7 @@ impl TriggerEngine {
             return self.finish_physical_mouse(btn, false, event.point, true, host);
         }
 
-        if self.passes_all() {
+        if self.paused {
             return self.finish_physical_mouse(btn, is_down, event.point, true, host);
         }
 
@@ -823,7 +815,7 @@ impl TriggerEngine {
         }
 
         // The keyboard hook is removed while paused (keyboard_hook_enabled)
-        if self.passes_all() {
+        if self.paused {
             return true;
         }
 
@@ -855,9 +847,8 @@ impl TriggerEngine {
                 // Already down in the system: in the hook, GetAsyncKeyState still tells the state
                 // from before this event, so this is a repeat of a press whose down reached the
                 // application with no record of it here. E.g. passed just before an InputLost
-                // sent earlier (at an unlock or a resume whose start was missed) was handled: the
-                // hook's events are handled before the posted messages, and the reset forgot it,
-                // or held when the keyboard hook was installed. It passes as that
+                // sent earlier (at an unlock or a resume) was handled: the hook's events are
+                // handled before the posted messages, and the reset forgot it. It passes as that
                 // press did, its up too: taken as a new press, it would start a scroll (or end
                 // one) and be suppressed, its up too, the key left pressed in the application.
                 // Not Pause, which does not repeat: its down is always a new press.
@@ -965,7 +956,7 @@ impl TriggerEngine {
         let Some(wait) = self.lr_wait.take() else {
             return;
         };
-        if self.passes_all() {
+        if self.paused {
             return;
         }
         self.last_flags.resent_down[wait.button.index()] = true;
@@ -977,7 +968,7 @@ impl TriggerEngine {
     }
 
     pub fn on_raw_motion(&mut self, dx: i32, dy: i32, time: u32, host: &mut impl TriggerHost) {
-        if self.passes_all() || (dx == 0 && dy == 0) {
+        if self.paused || (dx == 0 && dy == 0) {
             return;
         }
         let Some(scroll) = &mut self.scroll else {
@@ -999,9 +990,6 @@ impl TriggerEngine {
     }
 
     pub fn set_paused(&mut self, paused: bool, host: &mut impl TriggerHost) {
-        // Set by hand (the menu, --sendPassMode), also to what it is: the input is handled after,
-        // even if the resume was missed
-        self.sleeping = false;
         if self.paused == paused {
             return;
         }
@@ -1094,24 +1082,12 @@ impl TriggerEngine {
     /// The session was locked or unlocked, or the system suspended or resumed: the hooks saw none
     /// of the input meanwhile (it went to the secure desktop, or was lost). As init_state, and the
     /// records of all keys and buttons are forgotten as when the hooks were lost: none is still
-    /// held from before. Sent at the lock or the suspend, and done before the input is lost (see
-    /// app.rs, reset_input_at_loss); at the unlock or the resume only if that was missed.
+    /// held from before. Handled after the hook's events that came after it was sent: a key
+    /// passed then and forgotten passes on (see handle_key_inner, a repeat of a key down already).
     pub fn on_input_lost(&mut self, host: &mut impl TriggerHost) {
         self.init_state(host);
         self.tracker.forget_presses();
         self.key_flags.reset();
-    }
-
-    /// From the reset at a suspend (PBT_APMSUSPEND, sent before the system sleeps) to the resume:
-    /// all the input passes, as while paused, and none is kept. A trigger pressed before the
-    /// system sleeps would start a scroll, and its up be missed while it sleeps: the scroll would
-    /// be left on after the resume. The input after the resume, before the GUI handled it, passes
-    /// too (a press then is not a trigger; its repeats pass, see handle_key_inner, a key down
-    /// already), and nothing is reset at the resume. Ended by the resume only, not an unlock (one
-    /// can come between the suspend and the sleep), and by hand: Pass Mode (set_paused) and
-    /// --sendInitState (HookApp::on_event; not init_state, which a reset and Escape call).
-    pub fn set_sleeping(&mut self, sleeping: bool) {
-        self.sleeping = sleeping;
     }
 
     /// The keyboard hook has been removed (keyboard trigger off, or it could not be installed):
@@ -2288,64 +2264,6 @@ mod tests {
         assert_eq!(kb.handle_key(key(k, KeyAction::Down, 1100), &mut host), HookDecision::Pass);
         assert!(kb.is_scrolling());
         assert_eq!(kb.handle_key(key(k, KeyAction::Up, 1200), &mut host), HookDecision::Pass);
-    }
-
-    #[test]
-    fn sleeping_passes_all_input_until_the_resume() {
-        let mut cfg = Config::default();
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
-        let vk = TriggerKey::VkLmenu.vk_code();
-        let mut kb = TriggerEngine::new(
-            EngineConfig::from_config(&cfg, &CustomTableState::default()),
-            ResendTags::next_unique(),
-        );
-        let mut host = MockHost::new();
-
-        // Reset at the suspend, then pressed before the system sleeps (its up missed while it
-        // sleeps): no scroll, nothing left on after the resume
-        kb.on_input_lost(&mut host);
-        kb.set_sleeping(true);
-        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 100), &mut host), HookDecision::Pass);
-        assert!(!kb.is_scrolling());
-        kb.set_sleeping(false);
-        assert!(!kb.is_scrolling());
-        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 5000), &mut host), HookDecision::Suppress);
-        assert!(kb.is_scrolling());
-        kb.handle_key(key(vk, KeyAction::Up, 5500), &mut host);
-        assert!(!kb.is_scrolling());
-
-        // Pressed after the resume, before the GUI handled it: passes, its repeat and its up too
-        kb.set_sleeping(true);
-        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 6000), &mut host), HookDecision::Pass);
-        host.keys_down.push(vk);
-        kb.set_sleeping(false);
-        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 6500), &mut host), HookDecision::Pass);
-        assert!(!kb.is_scrolling());
-        assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 6520), &mut host), HookDecision::Pass);
-        host.keys_down.clear();
-
-        // A mouse trigger passes too
-        let (mut engine, _tags, mut host) = base_engine(Trigger::RightDrag);
-        engine.set_sleeping(true);
-        assert_eq!(
-            engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Right), 10, 10, 100), &mut host),
-            HookDecision::Pass
-        );
-        assert!(!engine.is_scrolling());
-        // Pass Mode ends it (the resume missed), turned off and on
-        engine.set_paused(true, &mut host);
-        engine.set_paused(false, &mut host);
-        engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Right), 10, 10, 200), &mut host);
-        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Right), 10, 10, 300), &mut host);
-        assert!(engine.is_scrolling());
-        engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Right), 10, 10, 400), &mut host);
-
-        // ...and set off only, as it is (--sendPassMode=false)
-        engine.set_sleeping(true);
-        engine.set_paused(false, &mut host);
-        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Right), 10, 10, 500), &mut host);
-        assert!(engine.is_scrolling());
     }
 
     #[test]

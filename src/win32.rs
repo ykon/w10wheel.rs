@@ -8,7 +8,6 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
-use std::sync::mpsc::SyncSender;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -98,17 +97,8 @@ pub(crate) enum Command {
     InitState,
     /// Installs the hooks again (after a resume or an unlock), to be first in the chain again
     ReinstallHooks,
-    /// The input will not be seen (a lock or a suspend): the triggers are reset if the sender still
-    /// waits (`accept`), and it is told when that is done (`done`); after a suspend, all the input
-    /// passes until the resume (InputBack, `resume`)
-    InputLost {
-        accept: SyncSender<()>,
-        done: SyncSender<()>,
-        suspend: bool,
-    },
-    /// The input is seen again (an unlock or a resume): the triggers are reset if the start was
-    /// missed (`reset`), and after a resume the input is handled again (`resume`)
-    InputBack { reset: bool, resume: bool },
+    /// The input was not seen (a lock, an unlock, a suspend or a resume): the triggers are reset
+    InputLost,
     WatchScroll(usize),
 }
 
