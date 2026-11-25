@@ -99,11 +99,16 @@ pub(crate) enum Command {
     /// Installs the hooks again (after a resume or an unlock), to be first in the chain again
     ReinstallHooks,
     /// The input will not be seen (a lock or a suspend): the triggers are reset if the sender still
-    /// waits (`done`), and after a suspend all the input passes until InputBack
-    InputLost { done: SyncSender<()>, suspend: bool },
+    /// waits (`accept`), and it is told when that is done (`done`); after a suspend, all the input
+    /// passes until the resume (InputBack, `resume`)
+    InputLost {
+        accept: SyncSender<()>,
+        done: SyncSender<()>,
+        suspend: bool,
+    },
     /// The input is seen again (an unlock or a resume): the triggers are reset if the start was
-    /// missed, and the input is handled again
-    InputBack(bool),
+    /// missed (`reset`), and after a resume the input is handled again (`resume`)
+    InputBack { reset: bool, resume: bool },
     WatchScroll(usize),
 }
 

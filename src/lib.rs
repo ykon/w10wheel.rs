@@ -15,9 +15,9 @@ mod win32;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cli::IpcCommand;
 pub use exclusions::{ExclusionList, ExclusionMatcher, ExclusionsFile};
@@ -238,21 +238,27 @@ impl HookApp {
                             self.sync_keyboard_hook(&mut hooks.keyboard, true);
                         }
                         Command::ReinstallHooks => self.reinstall_hooks(hooks),
-                        // Done only if the GUI still waits (a rendezvous: then it knows): after
-                        // its wait expired, it resets at the end instead (see input_lost_and_wait)
-                        Command::InputLost { done, suspend } => {
-                            if done.send(()).is_ok() {
-                                self.engine.on_input_lost(&mut self.host);
-                                if suspend {
-                                    self.engine.set_sleeping(true);
-                                }
+                        // Done only if the GUI still waits: after its wait expired, it resets at
+                        // the end instead (see input_lost_and_wait)
+                        Command::InputLost {
+                            accept,
+                            done,
+                            suspend,
+                        } => reset_if_accepted(accept, done, || {
+                            self.engine.on_input_lost(&mut self.host);
+                            if suspend {
+                                self.engine.set_sleeping(true);
                             }
-                        }
-                        Command::InputBack(reset) => {
+                        }),
+                        Command::InputBack { reset, resume } => {
                             if reset {
                                 self.engine.on_input_lost(&mut self.host);
                             }
-                            self.engine.set_sleeping(false);
+                            // Not at an unlock: one handled between the suspend and the sleep
+                            // would let a trigger start a scroll whose up the sleep misses
+                            if resume {
+                                self.engine.set_sleeping(false);
+                            }
                         }
                         Command::Stop => win32::quit(),
                         Command::WatchScroll(window) => {
@@ -338,6 +344,29 @@ impl HookApp {
     fn shutdown(&mut self) {
         self.engine.shutdown(&mut self.host);
     }
+}
+
+/// The hook thread's side of InputLost: `reset` is done only if the GUI still waits, accepted
+/// through a channel of no capacity (the answer is handed to the GUI waiting, or the GUI is seen
+/// gone: both know the same), and the GUI is told when it is done
+fn reset_if_accepted(accept: SyncSender<()>, done: SyncSender<()>, reset: impl FnOnce()) {
+    if accept.send(()).is_ok() {
+        reset();
+        let _ = done.send(());
+    }
+}
+
+/// The GUI's side of InputLost: whether the reset was accepted within `timeout`. Then it is done
+/// before any later input (the hook thread handles nothing else meanwhile), and this waits for it
+/// to be done, within the rest of `timeout` (before the system sleeps, after a suspend). Not
+/// accepted, it is not done at all.
+fn wait_reset(accepted: &Receiver<()>, finished: &Receiver<()>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    if accepted.recv_timeout(timeout).is_err() {
+        return false;
+    }
+    let _ = finished.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    true
 }
 
 fn handle_ipc_command(command: IpcCommand, encoded: usize) {
@@ -506,19 +535,26 @@ impl EngineControl {
 
     /// The input will not be seen (a lock or a suspend): a scroll is ended and the records of all
     /// keys and buttons are reset, waiting up to `timeout` for it to be done. After a suspend, all
-    /// the input passes until input_back (TriggerEngine::set_sleeping). Whether it was done: then
-    /// the unlock or the resume keeps the input. If not, it is not done later either (a channel
-    /// of no capacity: the hook thread hands its answer to the GUI waiting, or sees it gone): it
-    /// is done at the unlock or the resume, once.
+    /// the input passes until the resume (TriggerEngine::set_sleeping). Whether the hook thread
+    /// took it within `timeout` (see wait_reset): then it comes before any later input, and the
+    /// unlock or the resume keeps the input. If not, it is not done later either (see
+    /// reset_if_accepted): it is done at the unlock or the resume, once.
     pub fn input_lost_and_wait(&self, suspend: bool, timeout: Duration) -> bool {
-        let (done, wait) = mpsc::sync_channel(0);
-        self.send(Command::InputLost { done, suspend }).is_ok() && wait.recv_timeout(timeout).is_ok()
+        let (accept, accepted) = mpsc::sync_channel(0);
+        let (done, finished) = mpsc::sync_channel(1);
+        self.send(Command::InputLost {
+            accept,
+            done,
+            suspend,
+        })
+        .is_ok()
+            && wait_reset(&accepted, &finished, timeout)
     }
 
     /// The input is seen again (an unlock or a resume): reset as at input_lost_and_wait if that
-    /// was not done (`reset`), and handled again after a suspend
-    pub fn input_back(&self, reset: bool) -> io::Result<()> {
-        self.send(Command::InputBack(reset))
+    /// was not done (`reset`), and handled again after a resume (`resume`; not after an unlock)
+    pub fn input_back(&self, reset: bool, resume: bool) -> io::Result<()> {
+        self.send(Command::InputBack { reset, resume })
     }
 
     pub fn watch_scroll(&self, window: usize) -> io::Result<()> {
@@ -586,4 +622,53 @@ fn join_engine(worker: JoinHandle<io::Result<()>>) -> io::Result<()> {
     worker
         .join()
         .map_err(|_| io::Error::other("input hook stopped unexpectedly"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{reset_if_accepted, wait_reset};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    fn run(answer_after: Duration, reset_takes: Duration, timeout: Duration) -> (bool, bool, bool) {
+        let (accept, accepted) = mpsc::sync_channel(0);
+        let (done, finished) = mpsc::sync_channel(1);
+        let reset = Arc::new(AtomicBool::new(false));
+        let hook_reset = reset.clone();
+        let hook = thread::spawn(move || {
+            thread::sleep(answer_after);
+            reset_if_accepted(accept, done, || {
+                thread::sleep(reset_takes);
+                hook_reset.store(true, Ordering::SeqCst);
+            });
+        });
+        let taken = wait_reset(&accepted, &finished, timeout);
+        let reset_when_answered = reset.load(Ordering::SeqCst);
+        drop((accepted, finished));
+        hook.join().unwrap();
+        (taken, reset_when_answered, reset.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn the_reset_is_done_only_if_taken_in_time_and_waited_for() {
+        // Taken in time: done when the GUI goes on (not only taken)
+        assert_eq!(
+            run(Duration::from_millis(20), Duration::from_millis(100), Duration::from_millis(1000)),
+            (true, true, true)
+        );
+        // The wait expired first: never done
+        assert_eq!(
+            run(Duration::from_millis(200), Duration::ZERO, Duration::from_millis(20)),
+            (false, false, false)
+        );
+        // Taken in time, but slower than the rest of the wait: taken (it comes before any later
+        // input), done after
+        assert_eq!(
+            run(Duration::from_millis(10), Duration::from_millis(300), Duration::from_millis(50)),
+            (true, false, true)
+        );
+    }
 }

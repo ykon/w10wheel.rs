@@ -484,7 +484,7 @@ unsafe extern "system" fn tray_wnd_proc(
         {
             let automatic = wparam == PBT_APMRESUMEAUTOMATIC;
             let reset = resume_resets_input(&mut state.resume_seen, &mut state.suspend_reset, automatic);
-            on_input_back(hwnd, state, reset);
+            on_input_back(hwnd, state, reset, true);
             schedule_reinstall_hooks(hwnd, state);
         }
         WM_WTSSESSION_CHANGE if wparam == WTS_SESSION_LOCK => {
@@ -493,7 +493,8 @@ unsafe extern "system" fn tray_wnd_proc(
         WM_WTSSESSION_CHANGE if wparam == WTS_SESSION_UNLOCK => {
             // The lock missed (not notified, or its reset not done in time): reset now
             let reset = !std::mem::take(&mut state.lock_reset);
-            on_input_back(hwnd, state, reset);
+            // The input still passes if the system is to sleep (see TriggerEngine::set_sleeping)
+            on_input_back(hwnd, state, reset, false);
             schedule_reinstall_hooks(hwnd, state);
         }
         IPC_COMMAND_MESSAGE => {
@@ -642,12 +643,12 @@ fn reset_input_at_loss(hwnd: Handle, state: &mut TrayHostState, suspend: bool) -
     done
 }
 
-/// An unlock or a resume: the input is handled again after a suspend, and reset if the lock or
-/// the suspend was missed (`reset`: not notified, or its reset not done in time, see
-/// reset_input_at_loss). Done at the event, not when the hooks are installed again later (a
-/// scroll started after it goes on).
-fn on_input_back(hwnd: Handle, state: &mut TrayHostState, reset: bool) {
-    let _ = state.control.input_back(reset);
+/// An unlock or a resume: the input is reset if the lock or the suspend was missed (`reset`: not
+/// notified, or its reset not taken in time, see reset_input_at_loss), and handled again after a
+/// resume (`resume`: not after an unlock, which can come between the suspend and the sleep). Done
+/// at the event, not when the hooks are installed again later (a scroll started after it goes on).
+fn on_input_back(hwnd: Handle, state: &mut TrayHostState, reset: bool, resume: bool) {
+    let _ = state.control.input_back(reset, resume);
     if reset {
         let hw = unsafe { w::HWND::from_ptr(hwnd) };
         state.cursor.set_axis(&hw, None);

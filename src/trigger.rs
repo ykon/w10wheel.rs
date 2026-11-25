@@ -1106,7 +1106,8 @@ impl TriggerEngine {
     /// system sleeps would start a scroll, and its up be missed while it sleeps: the scroll would
     /// be left on after the resume. The input after the resume, before the GUI handled it, passes
     /// too (a press then is not a trigger; its repeats pass, see handle_key_inner, a key down
-    /// already), and nothing is reset at the resume. Ended also by Pass Mode, by hand.
+    /// already), and nothing is reset at the resume. Ended by the resume only, not an unlock (one
+    /// can come between the suspend and the sleep), and by Pass Mode, by hand.
     pub fn set_sleeping(&mut self, sleeping: bool) {
         self.sleeping = sleeping;
     }
