@@ -2,7 +2,7 @@
 name = "w10wheel"
 # The version of W10Wheel, as the Java and .NET versions: also that of the exe (its version
 # information and manifest, written by build.rs) and of About
-version = "2.10.0"
+version = "2.10.1"
 edition = "2024"
 publish = false
 
