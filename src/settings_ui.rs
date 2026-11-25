@@ -1890,12 +1890,8 @@ impl SettingsState {
             ID_CLOSE_BTN,
             None,
         );
-
-        // Populate the static key list once (the mouse triggers are in the language: retext_all)
-        for (_, display) in KEYBOARD_KEYS {
-            let w = to_wide(display);
-            send_msg(self.kb_combo, CB_ADDSTRING, 0, w.as_ptr() as isize);
-        }
+        // The lists of the mouse triggers and the trigger keys are filled in the language
+        // (retext_all)
     }
 
     fn on_dpi_changed(&mut self, new_dpi: u32, suggested: &Rect) {
@@ -2095,6 +2091,17 @@ impl SettingsState {
         }
         if mouse_sel >= 0 {
             send_msg(self.mouse_combo, CB_SETCURSEL, mouse_sel as usize, 0);
+        }
+
+        // Trigger key combo: some names translated (e.g. "VK_CONVERT (変換)"), as the .NET version
+        let kb_sel = send_msg(self.kb_combo, CB_GETCURSEL, 0, 0);
+        send_msg(self.kb_combo, CB_RESETCONTENT, 0, 0);
+        for (_, display) in KEYBOARD_KEYS {
+            let w = to_wide(tr(lang, display));
+            send_msg(self.kb_combo, CB_ADDSTRING, 0, w.as_ptr() as isize);
+        }
+        if kb_sel >= 0 {
+            send_msg(self.kb_combo, CB_SETCURSEL, kb_sel as usize, 0);
         }
         self.refreshing = false;
     }
@@ -2522,7 +2529,13 @@ impl SettingsState {
             0,
         );
 
-        let kb_content_w = self.fit_combo_width(nf, KEYBOARD_KEYS.iter().map(|(_, disp)| *disp));
+        // Wide enough for the names in both languages (as the mouse triggers)
+        let kb_content_w = self.fit_combo_width(
+            nf,
+            [UiLanguage::En, UiLanguage::Ja]
+                .into_iter()
+                .flat_map(|lang| KEYBOARD_KEYS.iter().map(move |&(_, disp)| tr(lang, disp))),
+        );
         let kb_box_w = kb_content_w.clamp(scale(120, dpi), scale(PANEL_RIGHT - 12 - cols[1], dpi));
         move_window(
             self.kb_combo,
@@ -2972,38 +2985,63 @@ impl SettingsState {
         let _ = s.store.store();
     }
 
+    /// Before leaving the selected properties (switching, restarting as administrator), after they
+    /// have been stored: true if nothing is left unsaved, else whether to go on and lose it, asked
+    /// with why it could not be saved (the error on a line of its own, then what is lost), as .NET
+    /// does (Ctx.confirmUnstoredLoss)
+    fn confirm_unsaved_loss(
+        &self,
+        lang: UiLanguage,
+        dark: bool,
+        loss: &'static str,
+        action: &'static str,
+    ) -> bool {
+        let (unsaved, why) = {
+            let s = self.shared.borrow();
+            (
+                s.store.has_unsaved_changes(),
+                s.store.unsaved_reason().map(str::to_owned),
+            )
+        };
+        if !unsaved {
+            return true;
+        }
+        let text = match why {
+            Some(why) => format!("{why}\n{}", tr(lang, loss)),
+            None => tr(lang, loss).to_owned(),
+        };
+        confirm_warning(
+            self.hwnd,
+            lang,
+            dark,
+            "W10Wheel",
+            tr(lang, "The changes could not be saved"),
+            &text,
+            tr(lang, action),
+        )
+    }
+
     fn on_switch_profile(&mut self) {
         self.commit_all_numbers();
         let sel = send_msg(self.profile_combo, CB_GETCURSEL, 0, 0);
         let Some(target) = self.profile_names.get(sel as usize).cloned() else {
             return;
         };
-        let (same, lang, dark, unsaved, tray_host) = {
+        let (same, lang, dark, tray_host) = {
             let mut s = self.shared.borrow_mut();
             let same = target == s.store.selected_profile();
             let _ = s.store.store();
-            (
-                same,
-                s.store.config().ui_language,
-                s.dark,
-                s.store.has_unsaved_changes(),
-                s.tray_host,
-            )
+            (same, s.store.config().ui_language, s.dark, s.tray_host)
         };
         if same {
             return;
         }
-        if unsaved
-            && !confirm_warning(
-                self.hwnd,
-                lang,
-                dark,
-                "W10Wheel",
-                tr(lang, "The changes could not be saved"),
-                tr(lang, "Switching loses the changes that could not be saved."),
-                tr(lang, "Switch"),
-            )
-        {
+        if !self.confirm_unsaved_loss(
+            lang,
+            dark,
+            "Switching loses the changes that could not be saved.",
+            "Switch",
+        ) {
             self.refresh_all();
             return;
         }
@@ -3080,13 +3118,14 @@ impl SettingsState {
         if selected == DEFAULT_PROFILE {
             return;
         }
-        let detail = format!("{} ({selected})", tr(lang, "Delete these properties?"));
+        // As the .NET version: the question, then which properties
+        let detail = format!("{}: {selected}", tr(lang, "Properties"));
         if !confirm_warning(
             self.hwnd,
             lang,
             dark,
             "W10Wheel",
-            tr(lang, "Delete Properties"),
+            tr(lang, "Delete these properties?"),
             &detail,
             tr(lang, "Delete"),
         ) {
@@ -3152,18 +3191,30 @@ impl SettingsState {
     }
 
     fn on_reset_defaults(&mut self) {
-        let (lang, dark) = {
+        let (lang, dark, selected) = {
             let s = self.shared.borrow();
-            (s.store.config().ui_language, s.dark)
+            (s.store.config().ui_language, s.dark, s.store.selected_profile().to_owned())
         };
+        // As the .NET version (Ctx.resetSettings): that the language is kept, and which
+        // properties (only Default is translated)
+        let shown = if selected == DEFAULT_PROFILE {
+            tr(lang, "Default").to_owned()
+        } else {
+            selected
+        };
+        let detail = format!(
+            "{}\n{}: {shown}",
+            tr(lang, "The language is kept."),
+            tr(lang, "Properties")
+        );
         if !confirm_warning(
             self.hwnd,
             lang,
             dark,
             "W10Wheel",
+            tr(lang, "Reset all the settings to their defaults?"),
+            &detail,
             tr(lang, "Reset to defaults"),
-            tr(lang, "Reset all settings and excluded programs to defaults?"),
-            tr(lang, "Reset"),
         ) {
             return;
         }
@@ -3199,7 +3250,7 @@ impl SettingsState {
 
     fn on_restart_as_admin(&mut self) {
         self.commit_all_numbers();
-        let (lang, dark, unsaved, selected, tray_host, err_slot) = {
+        let (lang, dark, selected, tray_host, err_slot) = {
             let mut s = self.shared.borrow_mut();
             if s.restarting_admin {
                 return;
@@ -3208,23 +3259,17 @@ impl SettingsState {
             (
                 s.store.config().ui_language,
                 s.dark,
-                s.store.has_unsaved_changes(),
                 s.store.selected_profile().to_owned(),
                 s.tray_host,
                 Arc::clone(&s.admin_error),
             )
         };
-        if unsaved
-            && !confirm_warning(
-                self.hwnd,
-                lang,
-                dark,
-                "W10Wheel",
-                tr(lang, "The changes could not be saved"),
-                tr(lang, "Restarting loses the changes that could not be saved."),
-                tr(lang, "Restart as administrator"),
-            )
-        {
+        if !self.confirm_unsaved_loss(
+            lang,
+            dark,
+            "Restarting loses the changes that could not be saved.",
+            "Restart as administrator",
+        ) {
             return;
         }
         self.shared.borrow_mut().restarting_admin = true;
@@ -3250,11 +3295,12 @@ impl SettingsState {
             let s = self.shared.borrow();
             (s.store.config().ui_language, s.dark)
         };
+        // The programs only, as the .NET version: "Programs (*.exe)" is the only filter
+        let filter_label = format!("{} (*.exe)", tr(lang, "Programs"));
         let Some((valid, rejected)) = pick_excluded_programs(
             self.hwnd,
             tr(lang, "Select programs to exclude"),
-            tr(lang, "Programs (*.exe)"),
-            tr(lang, "All files (*.*)"),
+            &filter_label,
         ) else {
             return;
         };

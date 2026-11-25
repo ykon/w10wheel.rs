@@ -1548,20 +1548,18 @@ pub(crate) fn filter_exe_selection(paths: &[PathBuf]) -> (Vec<String>, Vec<Strin
     (valid, rejected)
 }
 
+/// The programs to exclude, chosen in the file dialog of Windows: only the programs (*.exe) are
+/// listed, as in the .NET version. A file that is not one (e.g. its name typed in the box) is
+/// returned apart (the second list), to be told and not added.
 pub(crate) fn pick_excluded_programs(
     owner: Handle,
     title: &str,
     exe_filter_label: &str,
-    all_filter_label: &str,
 ) -> Option<(Vec<String>, Vec<String>)> {
     let mut filter_w = Vec::new();
     filter_w.extend(exe_filter_label.encode_utf16());
     filter_w.push(0);
     filter_w.extend("*.exe".encode_utf16());
-    filter_w.push(0);
-    filter_w.extend(all_filter_label.encode_utf16());
-    filter_w.push(0);
-    filter_w.extend("*.*".encode_utf16());
     filter_w.push(0);
     filter_w.push(0);
 

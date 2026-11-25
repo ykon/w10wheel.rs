@@ -20,10 +20,9 @@ pub fn tr(lang: UiLanguage, key: &'static str) -> &'static str {
         "No" => "いいえ",
         "Error" => "エラー",
         "Command Error" => "コマンドのエラー",
-        "Default" => "既定",
+        "Default" => "デフォルト",
         "Switch" => "切り替える",
         "Delete" => "削除",
-        "Reset" => "リセット",
 
         // Startup & Dialog Errors
         "W10Wheel is already running. This instance will exit." => "二重起動を検出したため終了します。",
@@ -34,7 +33,7 @@ pub fn tr(lang: UiLanguage, key: &'static str) -> &'static str {
         "So it won't work in the windows of some programs (those running as administrator). It's highly recommended to run it as administrator." => {
             "そのため、一部のプログラム (管理者として実行されているもの) のウィンドウでは機能しません。管理者として実行することを推奨します。"
         }
-        "More info (Wiki)" => "詳細情報 (Wiki)",
+        "More info (Wiki)" => "詳細 (Wiki)",
         "Restart as administrator" => "管理者として再起動",
         "Windows asks for permission (User Account Control)" => "UAC の確認が表示されます",
         "Continue without administrator rights" => "このまま実行",
@@ -58,10 +57,10 @@ pub fn tr(lang: UiLanguage, key: &'static str) -> &'static str {
         "Invalid Command Argument" => "コマンド引数が不正です",
 
         // Profile Bar & Bottom Bar
-        "Properties" => "プロファイル",
+        "Properties" => "設定ファイル",
         "Add" => "追加",
         "Open Dir" => "フォルダを開く",
-        "Reload" => "再読込",
+        "Reload" => "再読み込み",
         "Reset to defaults" => "既定値に戻す",
         "Close" => "閉じる",
         "Changes are applied and saved at once" => "変更はすぐに反映・保存されます",
@@ -73,10 +72,10 @@ pub fn tr(lang: UiLanguage, key: &'static str) -> &'static str {
         }
         "The changes could not be saved" => "変更を保存できませんでした",
         "The exclusions file could not be read: changes are not saved" => {
-            "除外設定ファイルを読み込めませんでした (除外の変更は保存されません)"
+            "除外リストのファイルを読み込めませんでした (変更は保存されません)"
         }
         "The changes could not be saved to the exclusions file" => {
-            "除外設定ファイルに保存できませんでした"
+            "除外リストのファイルに保存できませんでした"
         }
         "The properties file could not be read" => "設定ファイルを読み込めませんでした",
         "The exclusions file could not be read" => "除外設定ファイルを読み込めませんでした",
@@ -87,9 +86,6 @@ pub fn tr(lang: UiLanguage, key: &'static str) -> &'static str {
         "Add Properties" => "設定ファイル追加",
         "Delete Properties" => "設定ファイル削除",
         "Delete these properties?" => "この設定ファイルを削除しますか？",
-        "Reset all settings and excluded programs to defaults?" => {
-            "すべての設定と除外プログラムを既定値に戻しますか？"
-        }
         "Contains characters not allowed in file names" => {
             "ファイル名に使えない文字が含まれています"
         }
@@ -109,28 +105,44 @@ pub fn tr(lang: UiLanguage, key: &'static str) -> &'static str {
 
         // General Page
         "Language" => "言語",
-        "English" => "English",
+        "English" => "英語",
         // The mouse triggers with how their buttons are pressed (as the .NET version)
         "LR (Left <<-->> Right)" => "LR (左 <<-->> 右)",
         "Left (Left -->> Right)" => "Left (左 -->> 右)",
         "Right (Right -->> Left)" => "Right (右 -->> 左)",
         "X1" => "X1 (拡張1)",
         "X2" => "X2 (拡張2)",
+        // The trigger keys whose name is translated (as the .NET version)
+        "VK_CONVERT (Henkan)" => "VK_CONVERT (変換)",
+        "VK_NONCONVERT (Muhenkan)" => "VK_NONCONVERT (無変換)",
+        "VK_LWIN (Left Windows)" => "VK_LWIN (左 Windows)",
+        "VK_RWIN (Right Windows)" => "VK_RWIN (右 Windows)",
+        "VK_LSHIFT (Left Shift)" => "VK_LSHIFT (左 Shift)",
+        "VK_RSHIFT (Right Shift)" => "VK_RSHIFT (右 Shift)",
+        "VK_LCONTROL (Left Ctrl)" => "VK_LCONTROL (左 Ctrl)",
+        "VK_RCONTROL (Right Ctrl)" => "VK_RCONTROL (右 Ctrl)",
+        "VK_LMENU (Left Alt)" => "VK_LMENU (左 Alt)",
+        "VK_RMENU (Right Alt)" => "VK_RMENU (右 Alt)",
+        // The file dialog of the excluded programs: "Programs (*.exe)"
+        "Programs" => "プログラム",
+        // Reset to defaults (its confirmation, as the .NET version)
+        "Reset all the settings to their defaults?" => "すべての設定を既定値に戻しますか？",
+        "The language is kept." => "言語は変わりません。",
         "Japanese" => "日本語",
-        "Priority" => "優先度",
-        "High" => "高 (High)",
-        "Above Normal" => "通常以上 (Above Normal)",
-        "Normal" => "通常 (Normal)",
+        "Priority" => "プロセス優先度",
+        "High" => "高",
+        "Above Normal" => "通常以上",
+        "Normal" => "通常",
         "The language of the menu and the dialogs" => "メニューとダイアログの言語です",
         "The priority of the process of W10Wheel" => "W10Wheel のプロセスの優先度です",
 
         // Trigger Page
         "Mouse" => "マウス",
         "Keyboard" => "キーボード",
-        "Send MiddleClick" => "中クリックを送信",
-        "Dragged Lock" => "ドラッグ後にロック",
+        "Send MiddleClick" => "中クリック送信",
+        "Dragged Lock" => "ドラッグ後固定",
         "Simultaneous press time" => "同時押し判定時間",
-        "Scroll mode lock time" => "スクロール固定時間",
+        "Scroll mode lock time" => "スクロールモード固定判定時間",
         "Scrolling is disabled" => "スクロール機能が無効になっています",
         "The mouse buttons that start scroll mode\nUnchecked: no mouse trigger (the keyboard trigger only)" => {
             "スクロールモードを始めるマウスのボタンです\nチェックを外すとマウスのトリガーを使いません (キーボードトリガーのみの場合)"
@@ -154,8 +166,8 @@ pub fn tr(lang: UiLanguage, key: &'static str) -> &'static str {
         // Scroll Page
         "Cursor Change" => "カーソル変更",
         "Horizontal Scroll" => "水平スクロール",
-        "Reverse Scroll (Flip)" => "スクロール反転 (Flip)",
-        "Swap Scroll (V.H)" => "垂直・水平入替 (V.H)",
+        "Reverse Scroll (Flip)" => "スクロール反転",
+        "Swap Scroll (V.H)" => "垂直/水平スクロール入れ替え",
         "Vertical scroll threshold" => "垂直スクロール閾値",
         "Horizontal scroll threshold" => "水平スクロール閾値",
         "The thresholds are not used while VH Adjuster is enabled" => {
@@ -201,11 +213,11 @@ pub fn tr(lang: UiLanguage, key: &'static str) -> &'static str {
         "Not used: a value is not a number" => "使われていません: 数値でない値があります",
 
         // Real Wheel Mode Page
-        "Wheel delta" => "ホイール移動量",
-        "Vertical move per notch" => "1 ノッチあたりの垂直移動量",
-        "Horizontal move per notch" => "1 ノッチあたりの水平移動量",
-        "Quick first response" => "初回即応 (Quick first)",
-        "Quick turn response" => "折り返し即応 (Quick turn)",
+        "Wheel delta" => "ホイール回転値",
+        "Vertical move per notch" => "垂直ホイール移動値",
+        "Horizontal move per notch" => "水平ホイール移動値",
+        "Quick first response" => "初回の反応を速くする",
+        "Quick turn response" => "折り返しの反応を速くする",
         "Scrolls as a real wheel does, a notch at a time\nThe accel table is not used" => {
             "実際のホイールのように一回分ずつスクロールします\n加速テーブルは使われません"
         }
@@ -215,45 +227,43 @@ pub fn tr(lang: UiLanguage, key: &'static str) -> &'static str {
         "The vertical move made into a notch" => "一回分の垂直スクロールに変換する移動量です",
         "The horizontal move made into a notch" => "一回分の水平スクロールに変換する移動量です",
         "Sends the first notch whatever the move (else after half of the move)" => {
-            "移動量が小さくても最初の 1 ノッチを即座に送ります (無効時は半分の移動後)"
+            "移動量に関係なく最初の一回分を送ります (無効の場合は半分の移動量)"
         }
         "Sends a notch at once when the move turns back, whatever the move" => {
-            "逆方向へ切り返したとき、即座に 1 ノッチを送ります"
+            "折り返した場合、移動量に関係なく一回分を送ります"
         }
 
         // VH Adjuster Page
-        "Fixed" => "固定 (Fixed)",
-        "Switching" => "切替 (Switching)",
-        "Prefer vertical first" => "初回は垂直を優先",
-        "First direction threshold" => "初回方向判定の閾値",
-        "Switching threshold" => "方向切替の閾値",
+        "Fixed" => "固定",
+        "Switching" => "切り替え",
+        "Prefer vertical first" => "初回垂直スクロール優先",
+        "First direction threshold" => "初回判定閾値",
+        "Switching threshold" => "切り替え閾値",
         "Used when Horizontal Scroll is enabled" => "水平スクロールが有効な場合に使われます",
         "Scrolls in one direction at a time, vertical or horizontal" => {
-            "垂直または水平の一方向ずつスクロールします"
+            "垂直か水平の一方向だけにスクロールします"
         }
         "Fixed: the direction of the larger first move\nSwitching: also switched by a move above the switching threshold" => {
-            "Fixed: 最初に大きく動かした方向に固定\nSwitching: 切替閾値を超えた移動で方向を切り替え"
+            "固定: 初回の移動量が多い方向に固定します\n切り替え: さらに切り替え閾値を超える移動で方向を切り替えます"
         }
-        "The first direction prefers vertical" => "最初の方向判定で垂直を優先します",
+        "The first direction prefers vertical" => "初回の方向の判定で垂直を優先します",
         "The first direction is decided by a move above this (smaller moves are ignored)" => {
-            "この値を超える移動で最初の方向を決めます (小さい動きは無視)"
+            "この値を超える移動で初回の方向を判定します (それ以下は無視)"
         }
         "A move above this switches the direction (Switching)" => {
-            "この値を超える移動で方向を切り替えます (Switching)"
+            "この値を超える移動で方向を切り替えます (切り替え)"
         }
 
         // Excluded Programs Page
         "Add..." => "追加...",
         "Remove" => "削除",
-        "Select programs to exclude" => "除外するプログラムを選択",
-        "Programs (*.exe)" => "プログラム (*.exe)",
-        "All files (*.*)" => "すべてのファイル (*.*)",
+        "Select programs to exclude" => "除外するプログラムの選択",
         "These files are not programs (.exe): they were not added" => {
             "次のファイルはプログラム (.exe) ではないため追加されませんでした"
         }
-        "Scrolling is disabled in these programs" => "これらのプログラムではスクロールが無効になります",
+        "Scrolling is disabled in these programs" => "登録したプログラムではスクロール機能が無効になります",
         "The programs (.exe) whose windows have scrolling disabled\nJudged by the window under the cursor when a trigger is pressed\n(UWP / Store apps are not supported)" => {
-            "スクロールを無効にするプログラム (.exe) です\nトリガー押下時のカーソル下のウィンドウで判定されます\n(UWP / ストアアプリは対象外です)"
+            "スクロール機能を無効にするプログラム (.exe) を登録します\nトリガー操作時にカーソル下にあるウィンドウで判定されます\n(UWP/ストアアプリは非対応)"
         }
 
         _ => key,

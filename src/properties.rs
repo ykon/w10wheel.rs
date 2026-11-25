@@ -828,6 +828,24 @@ impl ConfigStore {
         self.exclusions_store_error.as_deref()
     }
 
+    /// Why the changes left unsaved could not be saved (has_unsaved_changes), as .NET tells it when
+    /// asking before they are lost (Ctx.confirmUnstoredLoss): the error of the settings first if
+    /// settings are left (that of the store, else of the load), else of the excluded programs
+    pub fn unsaved_reason(&self) -> Option<&str> {
+        let settings_unsaved =
+            !changed_keys(&self.config.to_property_map(), &self.stored_map).is_empty();
+        let of_settings = self.store_error.as_deref().or(self.load_error.as_deref());
+        let of_exclusions = self
+            .exclusions_store_error
+            .as_deref()
+            .or(self.exclusions_load_error.as_deref());
+        if settings_unsaved {
+            of_settings.or(of_exclusions)
+        } else {
+            of_exclusions.or(of_settings)
+        }
+    }
+
     pub fn has_unsaved_changes(&self) -> bool {
         !changed_keys(&self.config.to_property_map(), &self.stored_map).is_empty()
             || self.exclusions != self.stored_exclusions
