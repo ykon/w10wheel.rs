@@ -121,47 +121,69 @@ unsafe extern "system" {
 
 const REPLACEFILE_IGNORE_MERGE_ERRORS: u32 = 0x0000_0002;
 
-/// Paths of this length (in UTF-16 units) or longer are given the `\\?\` prefix, as std does for
-/// its own calls (MAX_PATH less the 12 units that a directory must leave for a 8.3 file name)
+/// A path of this length or longer, in UTF-16 units with its NUL, is given the `\\?\` prefix, as
+/// std does for its own calls (MAX_PATH less the 12 units that a directory must leave for a 8.3
+/// file name)
 const LEGACY_MAX_PATH: usize = 248;
 
-/// The path for a Win32 function called directly (std's own functions do this themselves): one
-/// that is long once made absolute (a relative one with the current directory) is given the
-/// `\\?\` prefix (`\\?\UNC\` for a share), as std and .NET (File.Replace) do. Without it, such a
-/// function fails for a long path (ERROR_PATH_NOT_FOUND) unless long paths are enabled for both
-/// the system and the process. Any other is passed as it is: a short one, one already verbatim
-/// or a device path (`\\.\`), and one that cannot be made absolute (not normalized, `\\?\` would
-/// take it literally).
+/// The path, NUL-terminated, for a Win32 function called directly (std's own functions do this
+/// themselves): one long once absolute is given the `\\?\` prefix, as std and .NET (File.Replace)
+/// do. Without it, such a function fails for a long path (ERROR_PATH_NOT_FOUND) unless long
+/// paths are enabled for both the system and the process. See long_path.
 fn wide_path(path: &Path) -> Vec<u16> {
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let mut wide = long_path(path.as_os_str().encode_wide().collect(), |wide| {
+        // GetFullPathNameW, as std's get_long_path
+        std::path::absolute(std::ffi::OsString::from_wide(wide))
+            .ok()
+            .map(|absolute| absolute.as_os_str().encode_wide().collect())
+    });
+    wide.push(0);
+    wide
+}
+
+/// The path (no NUL) as std makes it for its own calls (sys::path::windows::get_long_path, with
+/// prefer_verbatim false), `absolute` being GetFullPathNameW (None if it fails). Passed as it is
+/// if already verbatim (`\\?\`, `\??\`) or empty, or short and absolute (`C:\`, `C:`, `\\`). Else
+/// made absolute (normalized: `..` and `/` resolved, a relative one with the current directory),
+/// and, if that is long, given the prefix: `\\?\C:\`, `\\?\` for `\\.\` (a device path, which a
+/// file path may also be), `\\?\UNC\` for a share. A long path whose normalized form is short is
+/// passed so, with no prefix. One that cannot be made absolute is passed as it is (not
+/// normalized, `\\?\` would take it literally): the call then fails as it would have.
+fn long_path(path: Vec<u16>, absolute: impl FnOnce(&[u16]) -> Option<Vec<u16>>) -> Vec<u16> {
     const SEP: u16 = b'\\' as u16;
+    const ALT_SEP: u16 = b'/' as u16;
     const QUESTION: u16 = b'?' as u16;
     const DOT: u16 = b'.' as u16;
     const COLON: u16 = b':' as u16;
-    let encode = |p: &Path| -> Vec<u16> { p.as_os_str().encode_wide().collect() };
     let prefixed = |prefix: &str, rest: &[u16]| -> Vec<u16> {
         prefix.encode_utf16().chain(rest.iter().copied()).collect()
     };
-    let mut wide = encode(path);
-    let verbatim_or_device = matches!(wide.as_slice(), [SEP, SEP, QUESTION | DOT, SEP, ..]);
-    if !verbatim_or_device
-        && (wide.len() >= LEGACY_MAX_PATH || !path.is_absolute())
-        // Normalized as Windows would (GetFullPathNameW): `\\?\` turns that off
-        && let Ok(absolute) = std::path::absolute(path)
-    {
-        let full = encode(&absolute);
-        if full.len() >= LEGACY_MAX_PATH {
-            match full.as_slice() {
-                // A device (e.g. a name such as COM1 made `\\.\COM1`): as it was
-                [SEP, SEP, QUESTION | DOT, SEP, ..] => {}
-                [SEP, SEP, rest @ ..] => wide = prefixed(r"\\?\UNC\", rest),
-                [_, COLON, SEP, ..] => wide = prefixed(r"\\?\", &full),
-                _ => {}
-            }
+    let short = path.len() + 1 < LEGACY_MAX_PATH;
+    let as_it_is = match path.as_slice() {
+        [] | [SEP, SEP, QUESTION, SEP, ..] | [SEP, QUESTION, QUESTION, SEP, ..] => true,
+        [drive, COLON] | [drive, COLON, SEP | ALT_SEP, ..] => {
+            short && *drive != SEP && *drive != ALT_SEP
         }
+        [SEP | ALT_SEP, SEP | ALT_SEP, ..] => short,
+        _ => false,
+    };
+    if as_it_is {
+        return path;
     }
-    wide.push(0);
-    wide
+    let Some(absolute) = absolute(&path) else {
+        return path;
+    };
+    if absolute.len() + 1 < LEGACY_MAX_PATH {
+        return absolute;
+    }
+    match absolute.as_slice() {
+        [_, COLON, SEP, ..] => prefixed(r"\\?\", &absolute),
+        [SEP, SEP, DOT, SEP, rest @ ..] => prefixed(r"\\?\", rest),
+        [SEP, SEP, QUESTION, SEP, ..] | [SEP, QUESTION, QUESTION, SEP, ..] => absolute,
+        [SEP, SEP, rest @ ..] => prefixed(r"\\?\UNC\", rest),
+        _ => absolute,
+    }
 }
 
 /// The existing file replaced by the temporary one with ReplaceFile, as .NET File.Replace does: its
@@ -1659,26 +1681,78 @@ mod tests {
         Ok(())
     }
 
+    /// long_path with `absolute` given (a current directory of the test's own): independent of
+    /// the one the tests run in
+    fn long(path: &str, absolute: Option<&str>) -> String {
+        let out = long_path(path.encode_utf16().collect(), |_| {
+            absolute.map(|a| a.encode_utf16().collect())
+        });
+        String::from_utf16(&out).unwrap()
+    }
+
+    fn not_called(path: &str) -> String {
+        let out = long_path(path.encode_utf16().collect(), |_| {
+            panic!("made absolute: {path}")
+        });
+        String::from_utf16(&out).unwrap()
+    }
+
     #[test]
-    fn wide_path_prefixes_long_paths_only() {
+    fn long_path_measures_utf16_units_with_the_nul() {
+        // An absolute path of 246 units (247 with its NUL) is short, of 247 long. In Japanese:
+        // one UTF-16 unit, three UTF-8 bytes.
+        let at = |units: usize| format!(r"C:\{}", "あ".repeat(units - 3));
+        assert_eq!(long("r.properties", Some(&at(246))), at(246));
+        assert_eq!(long("r.properties", Some(&at(247))), format!(r"\\?\{}", at(247)));
+        // The same boundary for the path given, short and absolute: passed with no call
+        assert_eq!(not_called(&at(246)), at(246));
+        assert_eq!(not_called(r"C:\a\b.properties"), r"C:\a\b.properties");
+        assert_eq!(not_called("C:"), "C:");
+        assert_eq!(not_called(r"\\server\share\a"), r"\\server\share\a");
+        assert_eq!(not_called(""), "");
+        let verbatim = format!(r"\\?\C:\{}", "x".repeat(300));
+        assert_eq!(not_called(&verbatim), verbatim);
+        let nt = format!(r"\??\C:\{}", "x".repeat(300));
+        assert_eq!(not_called(&nt), nt);
+    }
+
+    #[test]
+    fn long_path_makes_relative_paths_absolute() {
+        // Long with the current directory only (Japanese in it)
+        let cwd = format!(r"C:\{}", "作業".repeat(150));
+        let full = format!(r"{cwd}\r.properties");
+        assert_eq!(long("r.properties", Some(&full)), format!(r"\\?\{full}"));
+        // Short with it: absolute, no prefix (as std)
+        assert_eq!(long("r.properties", Some(r"C:\w\r.properties")), r"C:\w\r.properties");
+        // Rooted on the current drive, or relative to a drive's directory: not absolute
+        assert_eq!(long(r"\a.properties", Some(r"C:\a.properties")), r"C:\a.properties");
+        assert_eq!(long("C:a.properties", Some(r"C:\w\a.properties")), r"C:\w\a.properties");
+        // Cannot be made absolute: as it is, not prefixed
+        let unnormalized = format!(r"{}\..\a.properties", "x".repeat(300));
+        assert_eq!(long(&unnormalized, None), unnormalized);
+    }
+
+    #[test]
+    fn wide_path_prefixes_paths_long_once_normalized() {
         let wide = |p: &str| String::from_utf16(&wide_path(Path::new(p))).unwrap();
-        assert_eq!(wide(r"C:\a\b.properties"), "C:\\a\\b.properties\0");
         let long = "x".repeat(300);
+        assert_eq!(wide(r"C:\a\b.properties"), "C:\\a\\b.properties\0");
         assert_eq!(wide(&format!(r"C:\{long}")), format!("\\\\?\\C:\\{long}\0"));
         assert_eq!(wide(&format!(r"C:\a\..\{long}")), format!("\\\\?\\C:\\{long}\0"));
+        assert_eq!(wide(&format!(r"C:/a/{long}")), format!("\\\\?\\C:\\a\\{long}\0"));
+        // Long, short once normalized: passed so
+        assert_eq!(
+            wide(&format!(r"C:\{long}\..\b.properties")),
+            "C:\\b.properties\0"
+        );
+        // A file path as a device path (`\\.\`): `\\?\` if long, as it is if short
+        assert_eq!(wide(&format!(r"\\.\C:\{long}")), format!("\\\\?\\C:\\{long}\0"));
+        assert_eq!(wide(r"\\.\C:\a.properties"), "\\\\.\\C:\\a.properties\0");
         assert_eq!(
             wide(&format!(r"\\server\share\{long}")),
             format!("\\\\?\\UNC\\server\\share\\{long}\0")
         );
         assert_eq!(wide(&format!(r"\\?\C:\{long}")), format!("\\\\?\\C:\\{long}\0"));
-        // Relative: long with the current directory only
-        let cwd = std::env::current_dir().unwrap();
-        let cwd = cwd.to_str().unwrap();
-        assert_eq!(&cwd[1..3], ":\\");
-        let rel = "r".repeat(LEGACY_MAX_PATH.saturating_sub(cwd.len()).max(1));
-        assert!(rel.len() < LEGACY_MAX_PATH);
-        assert_eq!(wide(&rel), format!("\\\\?\\{cwd}\\{rel}\0"));
-        assert_eq!(wide("short.properties"), "short.properties\0");
     }
 
     #[test]
@@ -1698,6 +1772,27 @@ mod tests {
         replace_file(&temporary, &path, true)?;
         assert_eq!(fs::read_to_string(&path)?, "a=1\r\n");
         assert!(!temporary.exists());
+
+        // The same file as a device path (`\\.\`), and through `..` (long, short once
+        // normalized): replaced, not left to the direct write
+        let device = PathBuf::from(format!(r"\\.\{}", path.display()));
+        fs::write(&temporary, "a=2\r\n")?;
+        replace_file(&temporary, &device, true)?;
+        assert_eq!(fs::read_to_string(&path)?, "a=2\r\n");
+        let short = dir.0.join("short.properties");
+        fs::write(&short, "b=0\r\n")?;
+        let mut detour = dir.0.clone();
+        for _ in 0..60 {
+            detour.push("x");
+            detour.push("..");
+        }
+        let detour = detour.join("short.properties");
+        assert!(detour.as_os_str().len() > 300);
+        let short_tmp = dir.0.join("short.properties.tmp");
+        fs::write(&short_tmp, "b=1\r\n")?;
+        replace_file(&short_tmp, &detour, true)?;
+        assert_eq!(fs::read_to_string(&short)?, "b=1\r\n");
+        assert!(!short_tmp.exists());
         Ok(())
     }
 
