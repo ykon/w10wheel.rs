@@ -8,6 +8,7 @@ use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 use std::ptr::{null, null_mut};
 use std::sync::OnceLock;
+use std::sync::mpsc::SyncSender;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -97,9 +98,9 @@ pub(crate) enum Command {
     InitState,
     /// Installs the hooks again (after a resume or an unlock), to be first in the chain again
     ReinstallHooks,
-    /// The input was not seen (a lock, an unlock, a suspend or a resume): the triggers are reset,
-    /// but for what the hooks saw since the time it was sent (tick_count)
-    InputLost(u32),
+    /// The input was not seen (a lock or a suspend, or an unlock or a resume whose start was
+    /// missed): the triggers are reset, and the sender told when it is done
+    InputLost(Option<SyncSender<()>>),
     WatchScroll(usize),
 }
 
@@ -249,7 +250,6 @@ unsafe extern "system" {
     fn GetModuleHandleW(name: *const u16) -> Handle;
     fn GetCurrentProcess() -> Handle;
     fn GetCurrentThreadId() -> u32;
-    fn GetTickCount() -> u32;
     fn GetLastError() -> u32;
     fn GetUserDefaultUILanguage() -> u16;
     fn SetPriorityClass(process: Handle, priority_class: u32) -> i32;
@@ -852,11 +852,6 @@ pub(crate) fn message_loop(
 
 pub(crate) fn current_thread_id() -> u32 {
     unsafe { GetCurrentThreadId() }
-}
-
-/// The time of the system in ms, as the time of the hook's events
-pub(crate) fn tick_count() -> u32 {
-    unsafe { GetTickCount() }
 }
 
 pub(crate) fn post_wake(thread: u32) -> io::Result<()> {

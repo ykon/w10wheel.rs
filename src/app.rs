@@ -44,6 +44,10 @@ const EXIT_RETRY_MS: u32 = 50;
 const REINSTALL_HOOKS_TIMER: usize = 4;
 const REINSTALL_HOOKS_DELAYS_MS: [u32; 2] = [2_000, 8_000];
 
+// The wait for the input reset at a lock or a suspend (see reset_input_at_loss): the hook thread
+// answers at once, unless it is stuck. Within the 2 s the system gives to WM_POWERBROADCAST.
+const INPUT_RESET_WAIT: Duration = Duration::from_millis(500);
+
 // The registration for the lock and unlock, retried if it failed (see
 // register_session_notification)
 const SESSION_NOTIFICATION_RETRY_TIMER: usize = 5;
@@ -131,6 +135,10 @@ struct TrayHostState {
     suspend_resume_notification: Option<Handle>,
     session_notification: bool,
     session_notification_retries: u32,
+    // The input was reset at the lock, and at the suspend (see reset_input_at_loss), done before
+    // it was lost: the unlock and the resume keep it. Cleared then.
+    lock_reset: bool,
+    suspend_reset: bool,
     // A resume was notified since the suspend (see resume_resets_input)
     resume_seen: bool,
 }
@@ -357,6 +365,8 @@ fn run(options: LaunchOptions) -> ExitCode {
         suspend_resume_notification: None,
         session_notification: false,
         session_notification_retries: 0,
+        lock_reset: false,
+        suspend_reset: false,
         resume_seen: false,
     });
 
@@ -467,22 +477,25 @@ unsafe extern "system" fn tray_wnd_proc(
         }
         WM_POWERBROADCAST if wparam == PBT_APMSUSPEND => {
             state.resume_seen = false;
-            on_input_lost(hwnd, state);
+            state.suspend_reset = reset_input_at_loss(hwnd, state);
         }
         WM_POWERBROADCAST
             if wparam == PBT_APMRESUMEAUTOMATIC || wparam == PBT_APMRESUMESUSPEND =>
         {
             let automatic = wparam == PBT_APMRESUMEAUTOMATIC;
-            if resume_resets_input(&mut state.resume_seen, automatic) {
+            if resume_resets_input(&mut state.resume_seen, &mut state.suspend_reset, automatic) {
                 on_input_lost(hwnd, state);
             }
             schedule_reinstall_hooks(hwnd, state);
         }
         WM_WTSSESSION_CHANGE if wparam == WTS_SESSION_LOCK => {
-            on_input_lost(hwnd, state);
+            state.lock_reset = reset_input_at_loss(hwnd, state);
         }
         WM_WTSSESSION_CHANGE if wparam == WTS_SESSION_UNLOCK => {
-            on_input_lost(hwnd, state);
+            // The lock missed (not notified, or its reset not done in time): reset now
+            if !std::mem::take(&mut state.lock_reset) {
+                on_input_lost(hwnd, state);
+            }
             schedule_reinstall_hooks(hwnd, state);
         }
         IPC_COMMAND_MESSAGE => {
@@ -611,13 +624,26 @@ fn init_state(hwnd: Handle, state: &mut TrayHostState) {
     state.cursor.set_axis(&hw, None);
 }
 
-/// The session was locked or unlocked, or the system suspended or resumed: the hooks see nothing
-/// of the input meanwhile (it goes to the secure desktop, or is lost), so a trigger released then
+/// The session was locked, or the system suspended: the hooks see nothing of the input until the
+/// unlock or the resume (it goes to the secure desktop, or is lost), so a trigger released then
 /// would keep its scroll mode (the moves suppressed), and a key or button released then would keep
-/// its records. A scroll is ended and all the records are reset, but for the keys the hook saw
-/// since (TriggerEngine::on_input_lost).
-/// Done at the event, not when the hooks are installed again later (a scroll started after it
-/// goes on).
+/// its records. A scroll is ended and all the records are reset (TriggerEngine::on_input_lost),
+/// before the input is lost: this waits for it to be done (the hook thread answers at once; the
+/// system waits for WM_POWERBROADCAST). Whether it was: then the unlock or the resume keeps the
+/// input (the hooks saw all of it since), and only installs the hooks again. Reset there, the
+/// input seen before the GUI handled the notification would be lost too (the hook's events are
+/// handled before the posted messages): a key pressed then would be taken as a new press at its
+/// repeat, and its scroll left on at its up, or its up suppressed.
+fn reset_input_at_loss(hwnd: Handle, state: &mut TrayHostState) -> bool {
+    let done = state.control.input_lost_and_wait(INPUT_RESET_WAIT);
+    let hw = unsafe { w::HWND::from_ptr(hwnd) };
+    state.cursor.set_axis(&hw, None);
+    done
+}
+
+/// An unlock or a resume whose lock or suspend was missed (not notified, or its reset not done in
+/// time, see reset_input_at_loss): reset now. Done at the event, not when the hooks are installed
+/// again later (a scroll started after it goes on).
 fn on_input_lost(hwnd: Handle, state: &mut TrayHostState) {
     let _ = state.control.input_lost();
     let hw = unsafe { w::HWND::from_ptr(hwnd) };
@@ -626,19 +652,19 @@ fn on_input_lost(hwnd: Handle, state: &mut TrayHostState) {
 
 /// A resume is notified once or twice: PBT_APMRESUMEAUTOMATIC first, always, and
 /// PBT_APMRESUMESUSPEND after it when the user wakes the system, maybe much later: at the first
-/// input after an automatic resume. The input is reset at PBT_APMRESUMEAUTOMATIC, always (also if
-/// the suspend was not notified), and at PBT_APMRESUMESUSPEND only if it came alone (none since the
-/// suspend): the hooks have seen the input since, and a reset would forget what they saw (a trigger
-/// key passed meanwhile would be taken as a new press: its repeats would start scroll mode, and its
-/// up be suppressed, the key left pressed in the application). The hooks are installed again after
-/// both (schedule_reinstall_hooks: from the last). As the Java and .NET versions do.
-/// `resume_seen` is set at a resume, cleared at the suspend.
-fn resume_resets_input(resume_seen: &mut bool, automatic: bool) -> bool {
-    if !automatic && *resume_seen {
-        return false;
-    }
+/// input after an automatic resume. The input reset at the suspend is kept (`suspend_reset`, see
+/// reset_input_at_loss). If it was not (the suspend not notified, or its reset not done in time),
+/// it is reset at the first of them: at PBT_APMRESUMEAUTOMATIC, and at PBT_APMRESUMESUSPEND only if
+/// it came alone (none since the suspend). Not at the second: the hooks have seen the input since,
+/// and a reset would forget what they saw (a trigger key passed meanwhile would be taken as a new
+/// press: its repeats would start scroll mode, and its up be suppressed, the key left pressed in
+/// the application). The hooks are installed again after both (schedule_reinstall_hooks: from the
+/// last). `resume_seen` is set at a resume, cleared at the suspend; `suspend_reset` is cleared at
+/// the first resume.
+fn resume_resets_input(resume_seen: &mut bool, suspend_reset: &mut bool, automatic: bool) -> bool {
+    let first = automatic || !*resume_seen;
     *resume_seen = true;
-    true
+    first && !std::mem::take(suspend_reset)
 }
 
 /// The keyboard hook could not be installed (at startup, at a load, or turned on in the dialog): the
@@ -915,17 +941,20 @@ mod tests {
     use super::resume_resets_input;
 
     #[test]
-    fn resume_resets_input_once_per_resume() {
-        // Suspend (cleared), automatic resume, then the user's: reset at the first only
-        let mut seen = false;
-        assert!(resume_resets_input(&mut seen, true));
-        assert!(!resume_resets_input(&mut seen, false));
-        // The user's resume alone after a suspend: reset
-        seen = false;
-        assert!(resume_resets_input(&mut seen, false));
-        // An automatic resume always resets, also when the suspend was not notified
-        assert!(resume_resets_input(&mut seen, true));
-        assert!(resume_resets_input(&mut seen, true));
-        assert!(!resume_resets_input(&mut seen, false));
+    fn resume_resets_input_only_if_the_suspend_was_missed() {
+        // Reset at the suspend: kept at both resumes
+        let (mut seen, mut reset) = (false, true);
+        assert!(!resume_resets_input(&mut seen, &mut reset, true));
+        assert!(!resume_resets_input(&mut seen, &mut reset, false));
+        // The next suspend not notified: reset at the automatic resume only
+        assert!(resume_resets_input(&mut seen, &mut reset, true));
+        assert!(!resume_resets_input(&mut seen, &mut reset, false));
+        // The suspend's reset not done in time, the user's resume alone: reset
+        let (mut seen, mut reset) = (false, false);
+        assert!(resume_resets_input(&mut seen, &mut reset, false));
+        assert!(!resume_resets_input(&mut seen, &mut reset, false));
+        // Reset at the suspend, the user's resume alone: kept
+        let (mut seen, mut reset) = (false, true);
+        assert!(!resume_resets_input(&mut seen, &mut reset, false));
     }
 }

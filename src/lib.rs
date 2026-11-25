@@ -238,7 +238,12 @@ impl HookApp {
                             self.sync_keyboard_hook(&mut hooks.keyboard, true);
                         }
                         Command::ReinstallHooks => self.reinstall_hooks(hooks),
-                        Command::InputLost(at) => self.engine.on_input_lost(at, &mut self.host),
+                        Command::InputLost(done) => {
+                            self.engine.on_input_lost(&mut self.host);
+                            if let Some(done) = done {
+                                let _ = done.send(());
+                            }
+                        }
                         Command::Stop => win32::quit(),
                         Command::WatchScroll(window) => {
                             self.host.scroll_window = window;
@@ -280,7 +285,7 @@ impl HookApp {
     /// was none, and a failure is reported as at a load (the setting turned off, not stored).
     /// Only a hook that Windows had removed already has its records reset (events may have been
     /// missed); the input missed while the session was locked or the system asleep is reset by
-    /// the InputLost sent then (see app.rs, on_input_lost).
+    /// the InputLost sent at the lock or the suspend (see app.rs, reset_input_at_loss).
     fn reinstall_hooks(&mut self, hooks: &mut win32::Hooks) {
         if let Ok(true) = hooks.reinstall_mouse() {
             self.engine.on_mouse_hook_lost(&mut self.host);
@@ -488,11 +493,18 @@ impl EngineControl {
         self.send(Command::ReinstallHooks)
     }
 
-    /// The input was not seen (a lock, an unlock, a suspend or a resume): a scroll is ended and
-    /// the records of all keys and buttons are reset, but for the keys the hook saw since now
-    /// (handled after it: see TriggerEngine::on_input_lost)
+    /// The input was not seen (an unlock or a resume whose start was missed): a scroll is ended
+    /// and the records of all keys and buttons are reset
     pub fn input_lost(&self) -> io::Result<()> {
-        self.send(Command::InputLost(win32::tick_count()))
+        self.send(Command::InputLost(None))
+    }
+
+    /// The input will not be seen (a lock or a suspend): as input_lost, waiting up to `timeout` for
+    /// it to be done. Whether it was: then the input seen after it is seen, not lost, and the
+    /// unlock or the resume keeps it.
+    pub fn input_lost_and_wait(&self, timeout: Duration) -> bool {
+        let (done, wait) = mpsc::sync_channel(1);
+        self.send(Command::InputLost(Some(done))).is_ok() && wait.recv_timeout(timeout).is_ok()
     }
 
     pub fn watch_scroll(&self, window: usize) -> io::Result<()> {
