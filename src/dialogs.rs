@@ -29,7 +29,8 @@ use crate::ui_win32::{measure_text_height, measure_text_width, move_window};
 
 pub(crate) const PROJECT_URL: &str = "https://github.com/ykon/w10wheel.net";
 pub(crate) const WIKI_URL: &str = "https://github.com/ykon/w10wheel.net/wiki";
-const PROGRAM_VERSION: &str = "2.10.0 (Rust)";
+// The version of Cargo.toml (as the version information of the exe)
+const PROGRAM_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (Rust)");
 const MODAL_CLASS: &str = "W10WheelModalDialog";
 
 const IDC_ARROW: usize = 32512;

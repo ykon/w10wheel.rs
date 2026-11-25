@@ -14,6 +14,8 @@ fn main() {
     for asset in assets {
         println!("cargo:rerun-if-changed={asset}");
     }
+    // The version is that of Cargo.toml
+    println!("cargo:rerun-if-changed=Cargo.toml");
 
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
@@ -33,18 +35,72 @@ fn main() {
         other => panic!("unsupported Windows target arch for rc.exe: {other}"),
     };
 
+    // The version of Cargo.toml, the one source of the version: the version information of the
+    // exe, its manifest, and About (env!("CARGO_PKG_VERSION"))
+    let version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION");
+    let numbers = version_numbers(&version);
+    let version4 = numbers.map(|n| n.to_string()).join(".");
+    let version_commas = numbers.map(|n| n.to_string()).join(",");
+    // VS_FF_DEBUG in a debug build
+    let file_flags = if env::var("PROFILE").as_deref() == Ok("debug") {
+        "0x1L"
+    } else {
+        "0x0L"
+    };
+
+    let manifest_path = out_dir.join("W10Wheel.manifest");
+    let manifest = read_template(&assets_dir.join("W10Wheel.manifest")).replace("@VERSION4@", &version4);
+    fs::write(&manifest_path, manifest).expect("failed to write the manifest");
+
+    let rc_path = out_dir.join("W10Wheel.rc");
+    let rc = read_template(&assets_dir.join("W10Wheel.rc"))
+        .replace("@APP_ICON@", &rc_path_literal(&assets_dir.join("AppIcon.ico")))
+        .replace("@MANIFEST@", &rc_path_literal(&manifest_path))
+        .replace("@VERSION_COMMAS@", &version_commas)
+        .replace("@VERSION4@", &version4)
+        .replace("@VERSION@", &version)
+        .replace("@FILE_FLAGS@", file_flags);
+    // UTF-16LE with a BOM: the paths may have any characters
+    let mut rc_bytes = vec![0xFF, 0xFE];
+    for unit in rc.encode_utf16() {
+        rc_bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    fs::write(&rc_path, rc_bytes).expect("failed to write the resource script");
+
     let rc_exe = find_rc_exe(arch).expect("could not locate Windows SDK rc.exe");
     let status = Command::new(&rc_exe)
-        .current_dir(&assets_dir)
+        .current_dir(&out_dir)
         .arg("/nologo")
         .arg("/fo")
         .arg(&res_path)
-        .arg("W10Wheel.rc")
+        .arg(&rc_path)
         .status()
         .expect("failed to launch rc.exe");
     assert!(status.success(), "rc.exe failed with status {status}");
 
     println!("cargo:rustc-link-arg-bin=W10Wheel={}", res_path.display());
+}
+
+/// major.minor.patch of a Cargo version, then 0: the four numbers of a Windows version (a
+/// pre-release or build part, e.g. "-beta.1", is not in them)
+fn version_numbers(version: &str) -> [u16; 4] {
+    let core = version.split(['-', '+']).next().unwrap_or(version);
+    let mut numbers = [0u16; 4];
+    for (slot, part) in numbers.iter_mut().zip(core.split('.')) {
+        *slot = part
+            .parse()
+            .unwrap_or_else(|_| panic!("version {version}: {part} is not a number up to 65535"));
+    }
+    numbers
+}
+
+fn read_template(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+}
+
+/// A path as a string of an .rc file (its backslashes escaped)
+fn rc_path_literal(path: &Path) -> String {
+    path.display().to_string().replace('\\', "\\\\")
 }
 
 fn find_rc_exe(arch: &str) -> Option<PathBuf> {

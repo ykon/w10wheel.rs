@@ -8,7 +8,9 @@ Windows 10 / 11 x64 向けの W10Wheel Rust 実装です。Rust の MSVC ツー�
 cargo build --release --offline --locked
 ```
 
-単一の GUI バイナリ `.\target\release\W10Wheel.exe` が生成されます。従来の W10Wheel（Java 版 / .NET 版）とは `%TEMP%\W10Wheel.lock` で多重起動を排他するため、既存の W10Wheel が起動している場合は終了してから実行してください。
+単一の GUI バイナリ `.\target\release\W10Wheel.exe` が生成されます。C ランタイムは静的リンク、アイコン（`AppIcon.ico` / `TrayIcon-Run.ico` / `TrayIcon-Stop.ico`）とマニフェスト・バージョン情報は exe に埋め込まれるため、この exe だけで動作します（依存は Windows 標準の DLL のみ）。
+
+バージョンは `Cargo.toml` の `version`（Java 版・.NET 版と同じ 2.10.0）が唯一の定義元で、`build.rs` が exe のバージョン情報とマニフェストに、バージョン情報画面が `CARGO_PKG_VERSION` から反映します。変更後は `Cargo.lock` の更新のため一度 `--locked` なしでビルドしてください。従来の W10Wheel（Java 版 / .NET 版）とは `%TEMP%\W10Wheel.lock` で多重起動を排他するため、既存の W10Wheel が起動している場合は終了してから実行してください。
 
 ## 実行と設定ファイル（Java / .NET 版と完全共通）
 

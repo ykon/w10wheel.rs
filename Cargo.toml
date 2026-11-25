@@ -1,6 +1,8 @@
 [package]
 name = "w10wheel"
-version = "0.1.0"
+# The version of W10Wheel, as the Java and .NET versions: also that of the exe (its version
+# information and manifest, written by build.rs) and of About
+version = "2.10.0"
 edition = "2024"
 publish = false
 
