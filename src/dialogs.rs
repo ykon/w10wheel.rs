@@ -27,8 +27,9 @@ use crate::ui_win32::{
 };
 use crate::ui_win32::{measure_text_height, measure_text_width, move_window};
 
-pub(crate) const PROJECT_URL: &str = "https://github.com/ykon/w10wheel.net";
-pub(crate) const WIKI_URL: &str = "https://github.com/ykon/w10wheel.net/wiki";
+// The repository of the Rust version (About: GitHub). No link to a Wiki: that of the .NET version
+// describes the .NET version.
+pub(crate) const PROJECT_URL: &str = "https://github.com/ykon/w10wheel.rs";
 // The version of Cargo.toml (as the version information of the exe)
 const PROGRAM_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (Rust)");
 const MODAL_CLASS: &str = "W10WheelModalDialog";
@@ -173,10 +174,6 @@ unsafe extern "system" fn modal_wnd_proc(
                                 state.done.set(true);
                                 return 0;
                             }
-                            103 => {
-                                let _ = open_shell_target(WIKI_URL);
-                                return 0;
-                            }
                             x if x == idcancel as u16 => {
                                 state.admin_result = (false, false);
                                 state.done.set(true);
@@ -196,10 +193,6 @@ unsafe extern "system" fn modal_wnd_proc(
                         match id {
                             101 => {
                                 let _ = open_shell_target(PROJECT_URL);
-                                return 0;
-                            }
-                            102 => {
-                                let _ = open_shell_target(WIKI_URL);
                                 return 0;
                             }
                             x if x == idok as u16 || x == idcancel as u16 => {
@@ -419,21 +412,19 @@ pub(crate) fn ask_restart_as_admin(lang: UiLanguage, dark: bool) -> (bool, bool)
 
     let normal = create_ui_font(dpi, UiFontKind::Normal);
     let bold = create_ui_font(dpi, UiFontKind::Bold);
-    let link_font = create_ui_font(dpi, UiFontKind::Link);
     let nf = normal.as_ref().map_or(null_mut(), |f| f.raw());
     let bf = bold.as_ref().map_or(nf, |f| f.raw());
-    let lf = link_font.as_ref().map_or(nf, |f| f.raw());
 
     let margin = scale(14, dpi);
     let ico_sz = scale(32, dpi);
     let text_x = margin + ico_sz + scale(12, dpi);
 
+    // No "More info (Wiki)" link, as the .NET version has: its Wiki describes the .NET version
     let head_txt = tr(lang, "W10Wheel is not running as administrator");
     let body_txt = tr(
         lang,
         "So it won't work in the windows of some programs (those running as administrator). It's highly recommended to run it as administrator.",
     );
-    let wiki_txt = tr(lang, "More info (Wiki)");
     let dont_txt = tr(lang, "Do not ask again");
     let restart_txt = tr(lang, "Restart as administrator");
     let cont_txt = tr(lang, "Continue without administrator rights");
@@ -448,14 +439,11 @@ pub(crate) fn ask_restart_as_admin(lang: UiLanguage, dark: bool) -> (bool, bool)
         .max(scale(340, dpi));
     let head_h = measure_text_height(hwnd, bf, head_txt, col_w).max(scale(18, dpi));
     let body_h = measure_text_height(hwnd, nf, body_txt, col_w).max(scale(32, dpi));
-    let wiki_w = measure_text_width(hwnd, lf, wiki_txt) + scale(4, dpi);
-    let wiki_h = measure_text_height(hwnd, lf, wiki_txt, col_w).max(scale(16, dpi));
     let chk_w = (measure_text_width(hwnd, nf, dont_txt) + scale(26, dpi)).min(col_w);
     let chk_h = scale(22, dpi);
 
     let body_y = margin + head_h + scale(6, dpi);
-    let wiki_y = body_y + body_h + scale(6, dpi);
-    let chk_y = wiki_y + wiki_h + scale(6, dpi);
+    let chk_y = body_y + body_h + scale(10, dpi);
     let btn_y = chk_y + chk_h + scale(10, dpi);
     resize_modal_client(
         hwnd,
@@ -469,18 +457,6 @@ pub(crate) fn ask_restart_as_admin(lang: UiLanguage, dark: bool) -> (bool, bool)
 
     add_label_px(hwnd, head_txt, text_x, margin, col_w, head_h, bf, 0, 0);
     add_label_px(hwnd, body_txt, text_x, body_y, col_w, body_h, nf, 0, 0);
-    let wiki_link = add_label_px(
-        hwnd,
-        wiki_txt,
-        text_x,
-        wiki_y,
-        wiki_w,
-        wiki_h,
-        lf,
-        103,
-        SS_NOTIFY,
-    );
-    state.link_controls.push(wiki_link);
 
     let dont_ask = create_window(
         0,
@@ -540,9 +516,6 @@ pub(crate) fn ask_restart_as_admin(lang: UiLanguage, dark: bool) -> (bool, bool)
     if let Some(f) = bold {
         state._fonts.push(f);
     }
-    if let Some(f) = link_font {
-        state._fonts.push(f);
-    }
 
     set_focus(restart_btn);
     run_modal_loop(hwnd, null_mut(), &state.done);
@@ -597,12 +570,11 @@ pub(crate) fn show_about(owner: Handle, lang: UiLanguage, dark: bool) {
             .unwrap_or(0);
         let ok_w = (measure_text_width(hwnd, nf, ok_txt) + scale(24, dpi)).max(scale(74, dpi));
         let ok_h = scale(26, dpi);
+        // The repository only (no Wiki: that of the .NET version describes the .NET version)
         let gh_w = measure_text_width(hwnd, lf, "GitHub") + scale(4, dpi);
-        let wiki_w = measure_text_width(hwnd, lf, "Wiki") + scale(4, dpi);
-        let link_h = measure_text_height(hwnd, lf, "Wiki", wiki_w.max(scale(40, dpi)))
+        let link_h = measure_text_height(hwnd, lf, "GitHub", gh_w.max(scale(40, dpi)))
             .max(scale(16, dpi));
-        let link_gap = scale(12, dpi);
-        let footer_min_w = gh_w + link_gap + wiki_w + scale(20, dpi) + ok_w;
+        let footer_min_w = gh_w + scale(20, dpi) + ok_w;
 
         let col_w = body_max_w
             .max(head_w)
@@ -638,19 +610,7 @@ pub(crate) fn show_about(owner: Handle, lang: UiLanguage, dark: bool) {
         add_label_px(hwnd, &body, content_x, body_y, col_w, body_h, nf, 0, 0);
 
         let gh = add_label_px(hwnd, "GitHub", content_x, link_y, gh_w, link_h, lf, 101, SS_NOTIFY);
-        let wiki = add_label_px(
-            hwnd,
-            "Wiki",
-            content_x + gh_w + link_gap,
-            link_y,
-            wiki_w,
-            link_h,
-            lf,
-            102,
-            SS_NOTIFY,
-        );
         state.link_controls.push(gh);
-        state.link_controls.push(wiki);
 
         let (idok, _) = dialog_ids();
         let ok_btn = add_button_px(

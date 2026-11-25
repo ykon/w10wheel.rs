@@ -33,7 +33,6 @@ pub fn tr(lang: UiLanguage, key: &'static str) -> &'static str {
         "So it won't work in the windows of some programs (those running as administrator). It's highly recommended to run it as administrator." => {
             "そのため、一部のプログラム (管理者として実行されているもの) のウィンドウでは機能しません。管理者として実行することを推奨します。"
         }
-        "More info (Wiki)" => "詳細 (Wiki)",
         "Restart as administrator" => "管理者として再起動",
         "Windows asks for permission (User Account Control)" => "UAC の確認が表示されます",
         "Continue without administrator rights" => "このまま実行",
