@@ -166,6 +166,10 @@ impl TriggerHost for Win32Host {
         win32::is_modifier_down()
     }
 
+    fn is_key_down(&self, vk_code: u32) -> bool {
+        win32::is_key_down(vk_code)
+    }
+
     fn is_excluded(&self, point: Point, exclusions: &ExclusionMatcher) -> bool {
         win32::is_point_excluded(point, exclusions)
     }

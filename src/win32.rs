@@ -902,6 +902,11 @@ fn is_vk_down(vk: i32) -> bool {
     unsafe { GetAsyncKeyState(vk) < 0 }
 }
 
+/// Whether the key is down now (the state of the keyboard, not of the messages taken so far)
+pub(crate) fn is_key_down(vk_code: u32) -> bool {
+    i32::try_from(vk_code).is_ok_and(is_vk_down)
+}
+
 pub(crate) fn is_escape_down() -> bool {
     is_vk_down(VK_ESCAPE)
 }

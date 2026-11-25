@@ -131,6 +131,8 @@ pub trait TriggerHost {
     fn cursor_pos(&self) -> Point;
     fn is_escape_down(&self) -> bool;
     fn is_modifier_down(&self) -> bool;
+    /// Whether the key is down now (GetAsyncKeyState)
+    fn is_key_down(&self, vk_code: u32) -> bool;
     fn is_excluded(&self, point: Point, exclusions: &ExclusionMatcher) -> bool;
 }
 
@@ -285,8 +287,8 @@ impl KeyFlags {
         self.last_key_event = None;
     }
 
-    /// The keyboard hook is removed, or keys were not seen (the old hook lost, the session locked):
-    /// the ups will not be seen, or were missed
+    /// The keyboard hook is removed, or keys were not seen (the session locked): the ups will not
+    /// be seen, or were missed
     fn reset(&mut self) {
         *self = Self::default();
     }
@@ -1024,15 +1026,29 @@ impl TriggerEngine {
     }
 
     /// The keyboard hook has been replaced, and Windows had removed the old one (e.g. for a
-    /// timeout): keys may have been released and pressed again with no hook to see them. All the
-    /// keys' records are forgotten (also those of the passed keys: one passed over an excluded
-    /// window and released meanwhile would pass its next press), and the scroll mode the trigger
-    /// key started (which would not end) is ended. A hook replaced while the old one was still
-    /// installed missed nothing: nothing is changed then (a scroll in progress goes on).
+    /// timeout): keys may have been released, and pressed again, with no hook to see it (the new
+    /// down reached the application). So nothing of before is kept: the scroll mode of the
+    /// trigger key is ended and all the keys' records are forgotten (a key passed over an
+    /// excluded window and released meanwhile would pass its next press). If the trigger key is
+    /// down now, it is taken as passed: its repeats and its up pass (they would start a scroll,
+    /// or the up of a down that reached the application be suppressed); its next press is the
+    /// trigger. The other keys pass anyway. GetAsyncKeyState tells only what it can (0 also when
+    /// it cannot): a key taken as up is a new press.
+    /// A hook replaced while the old one was still installed missed nothing: nothing is changed
+    /// then.
     pub fn on_keyboard_hook_lost(&mut self, host: &mut impl TriggerHost) {
-        self.key_flags.reset();
         if self.is_keyboard_scroll() {
             self.exit_scroll(host);
+        }
+        self.key_flags.reset();
+        let trigger = self.config.trigger.target_vk_code.vk_code();
+        if self.config.trigger.keyboard_enabled()
+            && trigger != VK_PAUSE
+            && let Ok(vk) = usize::try_from(trigger)
+            && vk < KEY_COUNT
+            && host.is_key_down(trigger)
+        {
+            self.key_flags.kd_passed[vk] = true;
         }
     }
 
@@ -1187,6 +1203,7 @@ mod tests {
         cursor: Point,
         escape_down: bool,
         modifier_down: bool,
+        keys_down: Vec<u32>,
         exclude_all: bool,
         excluded_points: Vec<Point>,
         raw_input_fails: bool,
@@ -1199,6 +1216,7 @@ mod tests {
                 cursor: Point { x: 500, y: 400 },
                 escape_down: false,
                 modifier_down: false,
+                keys_down: Vec::new(),
                 exclude_all: false,
                 excluded_points: Vec::new(),
                 raw_input_fails: false,
@@ -1267,6 +1285,9 @@ mod tests {
         }
         fn is_modifier_down(&self) -> bool {
             self.modifier_down
+        }
+        fn is_key_down(&self, vk_code: u32) -> bool {
+            self.keys_down.contains(&vk_code)
         }
         fn is_excluded(&self, point: Point, exclusions: &ExclusionMatcher) -> bool {
             if exclusions.is_empty() {
@@ -2088,6 +2109,46 @@ mod tests {
         host.cursor = Point { x: 20, y: 20 };
         assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 500), &mut host), HookDecision::Suppress);
         assert!(kb.is_scrolling());
+
+        // Passed over an excluded window and still held at the recovery (moved out meanwhile):
+        // its repeats and its up pass, no scroll starts.
+        kb.init_state(&mut host);
+        kb.handle_key(key(vk, KeyAction::Up, 600), &mut host);
+        host.cursor = excluded_pt;
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 700), &mut host), HookDecision::Pass);
+        host.cursor = Point { x: 20, y: 20 };
+        host.keys_down.push(vk);
+        kb.on_keyboard_hook_lost(&mut host);
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 730), &mut host), HookDecision::Pass);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 800), &mut host), HookDecision::Pass);
+        host.keys_down.clear();
+
+        // The trigger key in its scroll, released and pressed again with no hook (the new down
+        // reached the application), down at the recovery: the scroll is ended, and the repeats
+        // and the up of that new press pass (not suppressed as the old one's). The next press is
+        // the trigger.
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 900), &mut host), HookDecision::Suppress);
+        assert!(kb.is_scrolling());
+        host.keys_down.push(vk);
+        kb.on_keyboard_hook_lost(&mut host);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 930), &mut host), HookDecision::Pass);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 2000), &mut host), HookDecision::Pass);
+        host.keys_down.clear();
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 2100), &mut host), HookDecision::Suppress);
+        assert!(kb.is_scrolling());
+        kb.handle_key(key(vk, KeyAction::Up, 2200), &mut host);
+
+        // First pressed with no hook (no record of it), down at the recovery: its repeats and its
+        // up pass, no scroll starts.
+        kb.init_state(&mut host);
+        host.keys_down.push(vk);
+        kb.on_keyboard_hook_lost(&mut host);
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 3000), &mut host), HookDecision::Pass);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 3100), &mut host), HookDecision::Pass);
     }
 
     #[test]
