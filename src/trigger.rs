@@ -999,12 +999,13 @@ impl TriggerEngine {
     }
 
     pub fn set_paused(&mut self, paused: bool, host: &mut impl TriggerHost) {
+        // Set by hand (the menu, --sendPassMode), also to what it is: the input is handled after,
+        // even if the resume was missed
+        self.sleeping = false;
         if self.paused == paused {
             return;
         }
         self.paused = paused;
-        // Turned on or off by hand: the input is handled after, even if the resume was missed
-        self.sleeping = false;
         host.set_sender_paused(paused);
         if paused {
             self.init_state(host);
@@ -1107,7 +1108,8 @@ impl TriggerEngine {
     /// be left on after the resume. The input after the resume, before the GUI handled it, passes
     /// too (a press then is not a trigger; its repeats pass, see handle_key_inner, a key down
     /// already), and nothing is reset at the resume. Ended by the resume only, not an unlock (one
-    /// can come between the suspend and the sleep), and by Pass Mode, by hand.
+    /// can come between the suspend and the sleep), and by hand: Pass Mode (set_paused) and
+    /// --sendInitState (HookApp::on_event; not init_state, which a reset and Escape call).
     pub fn set_sleeping(&mut self, sleeping: bool) {
         self.sleeping = sleeping;
     }
@@ -2331,11 +2333,18 @@ mod tests {
             HookDecision::Pass
         );
         assert!(!engine.is_scrolling());
-        // Pass Mode ends it (the resume missed)
+        // Pass Mode ends it (the resume missed), turned off and on
         engine.set_paused(true, &mut host);
         engine.set_paused(false, &mut host);
         engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Right), 10, 10, 200), &mut host);
         engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Right), 10, 10, 300), &mut host);
+        assert!(engine.is_scrolling());
+        engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Right), 10, 10, 400), &mut host);
+
+        // ...and set off only, as it is (--sendPassMode=false)
+        engine.set_sleeping(true);
+        engine.set_paused(false, &mut host);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Right), 10, 10, 500), &mut host);
         assert!(engine.is_scrolling());
     }
 

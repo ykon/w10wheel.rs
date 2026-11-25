@@ -619,6 +619,8 @@ fn handle_ipc_command(hwnd: Handle, state: &mut TrayHostState, wparam: usize) {
 /// --sendInitState: ends a scroll and resets the triggers' records
 fn init_state(hwnd: Handle, state: &mut TrayHostState) {
     let _ = state.control.init_state();
+    // It also ends the passing after a suspend, as set_paused
+    state.suspend_reset = false;
     let hw = unsafe { w::HWND::from_ptr(hwnd) };
     state.cursor.set_axis(&hw, None);
 }
@@ -711,6 +713,9 @@ fn handle_keyboard_hook_failed(state: &mut TrayHostState, wparam: usize, lparam:
 
 fn set_paused(hwnd: Handle, state: &mut TrayHostState, paused: bool) {
     let _ = state.control.set_paused(paused);
+    // It also ends the passing after a suspend (TriggerEngine::set_paused), maybe for a resume
+    // missed: that suspend's reset is not kept for the next resume (the next suspend missed too)
+    state.suspend_reset = false;
     state.paused = paused;
     state.shared.borrow_mut().paused = paused;
     let hw = unsafe { w::HWND::from_ptr(hwnd) };

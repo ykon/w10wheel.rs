@@ -213,6 +213,8 @@ impl HookApp {
                         IpcCommand::SendExit => win32::quit(),
                         IpcCommand::SendPassMode(paused) => self.set_paused(paused, hooks),
                         IpcCommand::SendInitState => {
+                            // By hand: also ends the passing after a suspend (the resume missed)
+                            self.engine.set_sleeping(false);
                             self.engine.init_state(&mut self.host);
                             self.sync_keyboard_hook(&mut hooks.keyboard, true);
                         }
@@ -234,6 +236,8 @@ impl HookApp {
                             self.engine.end_scroll_after_load(&mut self.host);
                         }
                         Command::InitState => {
+                            // --sendInitState, by hand: as above
+                            self.engine.set_sleeping(false);
                             self.engine.init_state(&mut self.host);
                             self.sync_keyboard_hook(&mut hooks.keyboard, true);
                         }
