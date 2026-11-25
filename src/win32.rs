@@ -97,6 +97,8 @@ pub(crate) enum Command {
     InitState,
     /// Installs the hooks again (after a resume or an unlock), to be first in the chain again
     ReinstallHooks,
+    /// The input was not seen (a lock, an unlock, a suspend or a resume): the triggers are reset
+    InputLost,
     WatchScroll(usize),
 }
 

@@ -463,19 +463,19 @@ unsafe extern "system" fn tray_wnd_proc(
             }
         }
         WM_POWERBROADCAST if wparam == PBT_APMSUSPEND => {
-            init_state(hwnd, state);
+            on_input_lost(hwnd, state);
         }
         WM_POWERBROADCAST
             if wparam == PBT_APMRESUMEAUTOMATIC || wparam == PBT_APMRESUMESUSPEND =>
         {
-            init_state(hwnd, state);
+            on_input_lost(hwnd, state);
             schedule_reinstall_hooks(hwnd, state);
         }
         WM_WTSSESSION_CHANGE if wparam == WTS_SESSION_LOCK => {
-            init_state(hwnd, state);
+            on_input_lost(hwnd, state);
         }
         WM_WTSSESSION_CHANGE if wparam == WTS_SESSION_UNLOCK => {
-            init_state(hwnd, state);
+            on_input_lost(hwnd, state);
             schedule_reinstall_hooks(hwnd, state);
         }
         IPC_COMMAND_MESSAGE => {
@@ -597,13 +597,21 @@ fn handle_ipc_command(hwnd: Handle, state: &mut TrayHostState, wparam: usize) {
     }
 }
 
-/// Ends a scroll and resets the triggers' records (as --sendInitState). Also when the session is
-/// locked or unlocked, or the system suspended or resumed: the hooks see nothing of the input
-/// meanwhile (it goes to the secure desktop, or is lost), so a trigger released then would keep
-/// its scroll mode (the moves suppressed). Done at the event, not when the hooks are installed
-/// again later (a scroll started after it goes on).
+/// --sendInitState: ends a scroll and resets the triggers' records
 fn init_state(hwnd: Handle, state: &mut TrayHostState) {
     let _ = state.control.init_state();
+    let hw = unsafe { w::HWND::from_ptr(hwnd) };
+    state.cursor.set_axis(&hw, None);
+}
+
+/// The session was locked or unlocked, or the system suspended or resumed: the hooks see nothing
+/// of the input meanwhile (it goes to the secure desktop, or is lost), so a trigger released then
+/// would keep its scroll mode (the moves suppressed), and a key or button released then would keep
+/// its records. A scroll is ended and all the records are reset (TriggerEngine::on_input_lost).
+/// Done at the event, not when the hooks are installed again later (a scroll started after it
+/// goes on).
+fn on_input_lost(hwnd: Handle, state: &mut TrayHostState) {
+    let _ = state.control.input_lost();
     let hw = unsafe { w::HWND::from_ptr(hwnd) };
     state.cursor.set_axis(&hw, None);
 }

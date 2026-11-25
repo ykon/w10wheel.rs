@@ -187,6 +187,13 @@ impl ButtonTracker {
         }
     }
 
+    /// The buttons' ups may have been missed (no hook saw them): the suppressed downs are
+    /// forgotten, so the up of a press made meanwhile (which reached the application) is not
+    /// suppressed as theirs. The press ids are kept (resent events in flight are still told).
+    fn forget_suppressed(&mut self) {
+        self.down_suppressed = [false; MouseButton::COUNT];
+    }
+
     fn mark_release_queued(&mut self, button: MouseButton, press_id: u32) {
         self.release_queued_id[button.index()] = press_id;
     }
@@ -1015,7 +1022,18 @@ impl TriggerEngine {
             self.exit_scroll(host);
         }
         self.last_flags.reset();
+        self.tracker.forget_suppressed();
         self.last_mouse_event = None;
+    }
+
+    /// The session was locked or unlocked, or the system suspended or resumed: the hooks saw none
+    /// of the input meanwhile (it went to the secure desktop, or was lost). As init_state, and the
+    /// records of all keys and buttons are forgotten: none is still held from before (a key passed
+    /// over an excluded window and released meanwhile would pass its next press).
+    pub fn on_input_lost(&mut self, host: &mut impl TriggerHost) {
+        self.init_state(host);
+        self.tracker.forget_suppressed();
+        self.key_flags.reset();
     }
 
     pub fn on_keyboard_hook_lost(&mut self, host: &mut impl TriggerHost) {
@@ -1957,6 +1975,12 @@ mod tests {
         engine.on_mouse_hook_lost(&mut host);
         assert!(!engine.is_scrolling());
         assert!(host.take_calls().contains(&HostCall::StopRaw));
+        // Released and pressed again with no hook (that down reached the application): its up
+        // passes, not suppressed as the up of the first press (the button would stay down).
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Right), 10, 10, 800), &mut host),
+            HookDecision::Pass
+        );
         assert_eq!(
             engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Right), 10, 10, 900), &mut host),
             HookDecision::Suppress
@@ -1975,6 +1999,44 @@ mod tests {
         assert!(kb.is_scrolling());
         kb.on_mouse_hook_lost(&mut host);
         assert!(kb.is_scrolling());
+    }
+
+    #[test]
+    fn input_lost_forgets_all_keys_and_buttons() {
+        use crate::exclusions::ExclusionList;
+
+        // The trigger key passed over an excluded window, released while the session was locked:
+        // after the unlock, its first press starts the scroll.
+        let excluded_pt = Point { x: 100, y: 100 };
+        let mut cfg = Config::default();
+        cfg.keyboard_hook = true;
+        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let matcher = ExclusionList::from_lines(["C:\\Games\\game.exe"]).to_matcher();
+        let mut kb = TriggerEngine::new(
+            EngineConfig::from_config(&cfg, &CustomTableState::default()).with_exclusions(matcher),
+            ResendTags::next_unique(),
+        );
+        let mut host = MockHost::new();
+        host.excluded_points.push(excluded_pt);
+        let vk = TriggerKey::VkLmenu.vk_code();
+        host.cursor = excluded_pt;
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 10), &mut host), HookDecision::Pass);
+        kb.on_input_lost(&mut host);
+        host.cursor = Point { x: 20, y: 20 };
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 500), &mut host), HookDecision::Suppress);
+        assert!(kb.is_scrolling());
+
+        // A drag scroll whose trigger was released and pressed again while locked: ended, and the
+        // up after the unlock passes.
+        let (mut engine, _tags, mut host) = base_engine(Trigger::RightDrag);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Right), 10, 10, 100), &mut host);
+        assert!(engine.is_scrolling());
+        engine.on_input_lost(&mut host);
+        assert!(!engine.is_scrolling());
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Right), 10, 10, 800), &mut host),
+            HookDecision::Pass
+        );
     }
 
     #[test]

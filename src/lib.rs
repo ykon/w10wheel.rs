@@ -234,6 +234,7 @@ impl HookApp {
                             self.sync_keyboard_hook(&mut hooks.keyboard, true);
                         }
                         Command::ReinstallHooks => self.reinstall_hooks(hooks),
+                        Command::InputLost => self.engine.on_input_lost(&mut self.host),
                         Command::Stop => win32::quit(),
                         Command::WatchScroll(window) => {
                             self.host.scroll_window = window;
@@ -274,7 +275,7 @@ impl HookApp {
     /// was none, and a failure is reported as at a load (the setting turned off, not stored).
     /// Only a hook that Windows had removed already has its records reset (events may have been
     /// missed); the input missed while the session was locked or the system asleep is reset by
-    /// the InitState sent then (see app.rs, init_state).
+    /// the InputLost sent then (see app.rs, on_input_lost).
     fn reinstall_hooks(&mut self, hooks: &mut win32::Hooks) {
         if let Ok(true) = hooks.reinstall_mouse() {
             self.engine.on_mouse_hook_lost(&mut self.host);
@@ -469,6 +470,12 @@ impl EngineControl {
     /// Installs the hooks again (after a resume or an unlock): first in the chain again
     pub fn reinstall_hooks(&self) -> io::Result<()> {
         self.send(Command::ReinstallHooks)
+    }
+
+    /// The input was not seen (a lock, an unlock, a suspend or a resume): a scroll is ended and
+    /// the records of all keys and buttons are reset
+    pub fn input_lost(&self) -> io::Result<()> {
+        self.send(Command::InputLost)
     }
 
     pub fn watch_scroll(&self, window: usize) -> io::Result<()> {
