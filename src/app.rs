@@ -614,7 +614,8 @@ fn init_state(hwnd: Handle, state: &mut TrayHostState) {
 /// The session was locked or unlocked, or the system suspended or resumed: the hooks see nothing
 /// of the input meanwhile (it goes to the secure desktop, or is lost), so a trigger released then
 /// would keep its scroll mode (the moves suppressed), and a key or button released then would keep
-/// its records. A scroll is ended and all the records are reset (TriggerEngine::on_input_lost).
+/// its records. A scroll is ended and all the records are reset, but for the keys the hook saw
+/// since (TriggerEngine::on_input_lost).
 /// Done at the event, not when the hooks are installed again later (a scroll started after it
 /// goes on).
 fn on_input_lost(hwnd: Handle, state: &mut TrayHostState) {

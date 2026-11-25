@@ -238,7 +238,7 @@ impl HookApp {
                             self.sync_keyboard_hook(&mut hooks.keyboard, true);
                         }
                         Command::ReinstallHooks => self.reinstall_hooks(hooks),
-                        Command::InputLost => self.engine.on_input_lost(&mut self.host),
+                        Command::InputLost(at) => self.engine.on_input_lost(at, &mut self.host),
                         Command::Stop => win32::quit(),
                         Command::WatchScroll(window) => {
                             self.host.scroll_window = window;
@@ -489,9 +489,10 @@ impl EngineControl {
     }
 
     /// The input was not seen (a lock, an unlock, a suspend or a resume): a scroll is ended and
-    /// the records of all keys and buttons are reset
+    /// the records of all keys and buttons are reset, but for the keys the hook saw since now
+    /// (handled after it: see TriggerEngine::on_input_lost)
     pub fn input_lost(&self) -> io::Result<()> {
-        self.send(Command::InputLost)
+        self.send(Command::InputLost(win32::tick_count()))
     }
 
     pub fn watch_scroll(&self, window: usize) -> io::Result<()> {
