@@ -369,6 +369,89 @@ impl ActiveScroll {
     }
 }
 
+/// The scroll a reset ends, if one is going on
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndScroll {
+    /// Started by a mouse trigger
+    Mouse,
+    /// Started by the keyboard trigger
+    Keyboard,
+    Any,
+}
+
+/// What a reset does with the records of the mouse buttons
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MouseRecords {
+    Keep,
+    /// The LR wait is ended, and the triggers' records of the buttons (LastFlags) are reset. The
+    /// presses are still known (ButtonTracker): the up of a suppressed down is still suppressed.
+    Reset,
+    /// As Reset, and the presses are forgotten too (ButtonTracker::forget_presses): their ups may
+    /// have been missed.
+    Forget,
+}
+
+/// What a reset does with the records of the keys (KeyStates)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyRecords {
+    Keep,
+    /// The up of a suppressed key is still suppressed, alone (KeyState::LoneUp)
+    LoneUp,
+    /// All forgotten: the ups may have been missed, or will not be seen
+    Clear,
+}
+
+/// What an event ends and forgets, all in one place:
+///
+/// | Reset              | scroll   | mouse  | keys   |
+/// |--------------------|----------|--------|--------|
+/// | INIT_STATE         | Any      | Reset  | LoneUp |
+/// | INPUT_LOST         | Any      | Forget | Clear  |
+/// | MOUSE_HOOK_LOST    | Mouse    | Forget | Keep   |
+/// | KEYBOARD_HOOK_GONE | Keyboard | Keep   | Clear  |
+/// | LOAD               | Any      | Keep   | Keep   |
+#[derive(Clone, Copy, Debug)]
+struct Reset {
+    scroll: EndScroll,
+    mouse: MouseRecords,
+    keys: KeyRecords,
+}
+
+impl Reset {
+    /// init_state: all is ended, and nothing seen was missed
+    const INIT_STATE: Self = Self {
+        scroll: EndScroll::Any,
+        mouse: MouseRecords::Reset,
+        keys: KeyRecords::LoneUp,
+    };
+    /// on_input_lost: a lock, an unlock, a suspend or a resume (none of the input was seen)
+    const INPUT_LOST: Self = Self {
+        scroll: EndScroll::Any,
+        mouse: MouseRecords::Forget,
+        keys: KeyRecords::Clear,
+    };
+    /// on_mouse_hook_lost: Windows had removed the mouse hook (its events were missed)
+    const MOUSE_HOOK_LOST: Self = Self {
+        scroll: EndScroll::Mouse,
+        mouse: MouseRecords::Forget,
+        keys: KeyRecords::Keep,
+    };
+    /// on_keyboard_hook_lost and on_keyboard_hook_removed: no keyboard hook saw the keys, or will
+    /// see them
+    const KEYBOARD_HOOK_GONE: Self = Self {
+        scroll: EndScroll::Keyboard,
+        mouse: MouseRecords::Keep,
+        keys: KeyRecords::Clear,
+    };
+    /// end_scroll_after_load: the scroll settings apply from the next scroll; the trigger's up is
+    /// still suppressed
+    const LOAD: Self = Self {
+        scroll: EndScroll::Any,
+        mouse: MouseRecords::Keep,
+        keys: KeyRecords::Keep,
+    };
+}
+
 pub struct TriggerEngine {
     config: EngineConfig,
     tags: ResendTags,
@@ -986,14 +1069,10 @@ impl TriggerEngine {
         }
     }
 
+    /// --sendInitState, Pass Mode turned on, the trigger changed, Escape down at a button's up, the
+    /// exit: see Reset::INIT_STATE
     pub fn init_state(&mut self, host: &mut impl TriggerHost) {
-        if self.lr_wait.take().is_some() {
-            host.kill_poll_timer();
-        }
-        self.exit_scroll(host);
-        self.last_flags.reset();
-        self.keys.suppressed_to_lone_up();
-        self.last_mouse_event = None;
+        self.reset(Reset::INIT_STATE, host);
     }
 
     /// The mouse hook has been replaced, and Windows had removed the old one (e.g. for a
@@ -1003,15 +1082,7 @@ impl TriggerEngine {
     /// hook replaced while the old one was still installed missed nothing: nothing is changed
     /// then.
     pub fn on_mouse_hook_lost(&mut self, host: &mut impl TriggerHost) {
-        if self.lr_wait.take().is_some() {
-            host.kill_poll_timer();
-        }
-        if self.is_mouse_scroll() {
-            self.exit_scroll(host);
-        }
-        self.last_flags.reset();
-        self.tracker.forget_presses();
-        self.last_mouse_event = None;
+        self.reset(Reset::MOUSE_HOOK_LOST, host);
     }
 
     /// The keyboard hook has been replaced, and Windows had removed the old one (e.g. for a
@@ -1023,10 +1094,7 @@ impl TriggerEngine {
     /// A hook replaced while the old one was still installed missed nothing: nothing is changed
     /// then.
     pub fn on_keyboard_hook_lost(&mut self, host: &mut impl TriggerHost) {
-        if self.is_keyboard_scroll() {
-            self.exit_scroll(host);
-        }
-        self.keys.reset();
+        self.reset(Reset::KEYBOARD_HOOK_GONE, host);
         self.pass_held_trigger_key(host);
     }
 
@@ -1060,31 +1128,54 @@ impl TriggerEngine {
     /// held from before. Handled after the hook's events that came after it was sent: a key
     /// passed then and forgotten passes on (see handle_key_inner, a repeat of a key down already).
     pub fn on_input_lost(&mut self, host: &mut impl TriggerHost) {
-        self.init_state(host);
-        self.tracker.forget_presses();
-        self.keys.reset();
+        self.reset(Reset::INPUT_LOST, host);
     }
 
     /// The keyboard hook has been removed (keyboard trigger off, or it could not be installed):
     /// its records are reset and the scroll mode of the trigger key is ended.
     pub fn on_keyboard_hook_removed(&mut self, host: &mut impl TriggerHost) {
-        self.keys.reset();
-        if self.is_keyboard_scroll() {
-            self.exit_scroll(host);
-        }
+        self.reset(Reset::KEYBOARD_HOOK_GONE, host);
     }
 
     /// The properties have been loaded (Reload, switching, adding, deleting or resetting them):
     /// the scroll settings apply from the next scroll, so a scroll in progress is ended, as .NET
     /// does (Ctx.applyProperties). The trigger's up is still suppressed (its flags are kept).
     pub fn end_scroll_after_load(&mut self, host: &mut impl TriggerHost) {
-        if self.scroll.is_some() {
-            self.exit_scroll(host);
-        }
+        self.reset(Reset::LOAD, host);
     }
 
     pub fn shutdown(&mut self, host: &mut impl TriggerHost) {
         self.init_state(host);
+    }
+
+    /// Ends the LR wait and the scroll, and forgets the records, as `reset` tells (see Reset)
+    fn reset(&mut self, reset: Reset, host: &mut impl TriggerHost) {
+        if reset.mouse != MouseRecords::Keep && self.lr_wait.take().is_some() {
+            host.kill_poll_timer();
+        }
+        let ends_scroll = match reset.scroll {
+            EndScroll::Mouse => self.is_mouse_scroll(),
+            EndScroll::Keyboard => self.is_keyboard_scroll(),
+            EndScroll::Any => self.scroll.is_some(),
+        };
+        if ends_scroll {
+            self.exit_scroll(host);
+        }
+        match reset.mouse {
+            MouseRecords::Keep => {}
+            MouseRecords::Reset | MouseRecords::Forget => {
+                self.last_flags.reset();
+                self.last_mouse_event = None;
+                if reset.mouse == MouseRecords::Forget {
+                    self.tracker.forget_presses();
+                }
+            }
+        }
+        match reset.keys {
+            KeyRecords::Keep => {}
+            KeyRecords::LoneUp => self.keys.suppressed_to_lone_up(),
+            KeyRecords::Clear => self.keys.reset(),
+        }
     }
 
     /// false if Raw Input could not be registered: scroll mode is not started then (the moves
@@ -2516,5 +2607,95 @@ mod tests {
         host.keys_down.clear();
         assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Down, 3200), &mut host), HookDecision::Suppress);
         assert!(kb.is_scrolling());
+    }
+
+    /// The mouse trigger on LR, the keyboard trigger on Left Alt
+    fn lr_kb_engine() -> (TriggerEngine, MockHost, u32) {
+        let mut cfg = Config::default();
+        cfg.first_trigger = Trigger::Lr;
+        cfg.keyboard_hook = true;
+        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let engine = TriggerEngine::new(
+            EngineConfig::from_config(&cfg, &CustomTableState::default()),
+            ResendTags::next_unique(),
+        );
+        (engine, MockHost::new(), TriggerKey::VkLmenu.vk_code())
+    }
+
+    #[test]
+    fn keyboard_hook_changes_keep_the_mouse_triggers() {
+        let (mut engine, mut host, _) = lr_kb_engine();
+
+        // The wait of the LR trigger goes on: the other button makes the pair
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 10, 10, 100), &mut host);
+        host.take_calls();
+        engine.on_keyboard_hook_lost(&mut host);
+        engine.on_keyboard_hook_removed(&mut host);
+        assert!(host.take_calls().is_empty());
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Right), 10, 10, 150), &mut host),
+            HookDecision::Suppress
+        );
+        assert!(engine.is_scrolling());
+
+        // The mouse scroll goes on
+        engine.on_keyboard_hook_lost(&mut host);
+        engine.on_keyboard_hook_removed(&mut host);
+        assert!(engine.is_scrolling());
+    }
+
+    #[test]
+    fn mouse_hook_lost_keeps_the_keys() {
+        let (mut engine, mut host, vk) = lr_kb_engine();
+        assert_eq!(engine.handle_key(key(vk, KeyAction::Down, 100), &mut host), HookDecision::Suppress);
+        engine.on_mouse_hook_lost(&mut host);
+        assert!(engine.is_scrolling());
+        // Its up is still the trigger's: suppressed, it ends the scroll (past the locktime)
+        assert_eq!(engine.handle_key(key(vk, KeyAction::Up, 500), &mut host), HookDecision::Suppress);
+        assert!(!engine.is_scrolling());
+    }
+
+    #[test]
+    fn a_load_ends_the_scroll_and_keeps_the_lr_wait() {
+        let (mut engine, mut host, _) = lr_kb_engine();
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 10, 10, 100), &mut host);
+        host.take_calls();
+        engine.end_scroll_after_load(&mut host);
+        assert!(host.take_calls().is_empty());
+        // Timed out, the waiting down is resent
+        engine.on_poll_timeout(&mut host);
+        assert!(matches!(
+            host.take_calls().as_slice(),
+            [HostCall::KillTimer, HostCall::Down(MouseButton::Left, _, _)]
+        ));
+    }
+
+    #[test]
+    fn init_state_ends_the_lr_wait_and_input_lost_forgets_its_press() {
+        // init_state: the wait is ended (its down not resent), and the up of that press, whose
+        // down reached no application, is suppressed alone
+        let (mut engine, mut host, _) = lr_kb_engine();
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 10, 10, 100), &mut host);
+        host.take_calls();
+        engine.init_state(&mut host);
+        assert!(host.take_calls().contains(&HostCall::KillTimer));
+        engine.on_poll_timeout(&mut host);
+        assert_eq!(host.take_calls(), vec![HostCall::KillTimer]);
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Left), 10, 10, 200), &mut host),
+            HookDecision::Suppress
+        );
+
+        // on_input_lost: the press is forgotten too (its up may have been missed, and the up of a
+        // press made meanwhile reached the application with its down): the up passes
+        let (mut engine, mut host, _) = lr_kb_engine();
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 10, 10, 100), &mut host);
+        host.take_calls();
+        engine.on_input_lost(&mut host);
+        assert!(host.take_calls().contains(&HostCall::KillTimer));
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Left), 10, 10, 200), &mut host),
+            HookDecision::Pass
+        );
     }
 }
