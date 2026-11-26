@@ -9,7 +9,7 @@ use crate::ui_win32::{PaintStruct, begin_paint, dpi_for_window, end_paint};
 
 type Handle = *mut c_void;
 
-pub(crate) const THEME_CHANGED_MESSAGE: u32 = 0x8006; // WM_APP + 6
+pub(crate) use w10wheel::wm_app::THEME_CHANGED_MESSAGE;
 
 const HKEY_CURRENT_USER: Handle = 0x8000_0001_u32 as usize as Handle;
 const KEY_READ: u32 = 0x0002_0019;

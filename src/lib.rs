@@ -11,6 +11,7 @@ pub mod scroll;
 pub mod sender;
 pub mod trigger;
 mod win32;
+pub mod wm_app;
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -39,17 +40,9 @@ thread_local! {
 
 const GUI_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
-// Sent to the GUI when scroll cursor state starts, changes axis, or stops.
-pub const SCROLL_ACTIVITY_MESSAGE: u32 = 0x8003; // WM_APP + 3
-// Sent to the GUI when an injected W10Message IPC command arrives.
-pub const IPC_COMMAND_MESSAGE: u32 = 0x8004; // WM_APP + 4
-// Sent to the GUI when the keyboard hook could not be installed: wparam is the Win32 error code,
-// lparam is KEYBOARD_HOOK_FAILED_ON_LOAD when it was installed for a load of the properties (at
-// startup, Reload, switching...): the setting is then turned off without being written to the
-// file, as .NET does. Otherwise (the setting changed in the dialog) the change is stored as off.
-// (WM_APP + 5 to + 7 are the GUI's own: ADMIN_RESTART_MESSAGE, THEME_CHANGED_MESSAGE,
-// TRAY_SYNC_MESSAGE)
-pub const KEYBOARD_HOOK_FAILED_MESSAGE: u32 = 0x8008; // WM_APP + 8
+pub use wm_app::{IPC_COMMAND_MESSAGE, KEYBOARD_HOOK_FAILED_MESSAGE, SCROLL_ACTIVITY_MESSAGE};
+// The lparam of KEYBOARD_HOOK_FAILED_MESSAGE when the hook was installed for a load of the
+// properties
 pub const KEYBOARD_HOOK_FAILED_ON_LOAD: isize = 1;
 
 struct Win32Host {
