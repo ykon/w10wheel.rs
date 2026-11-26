@@ -520,18 +520,19 @@ impl<S: SendSink> SenderWorker<S> {
                 point,
                 extra_info,
             } => {
-                if !self.closing && !self.click_delay.is_zero() {
-                    if let Some(sent_at) = self.last_down_sent[button.index()] {
-                        let due = sent_at + self.click_delay;
-                        if due > Instant::now() {
-                            self.pending_up = Some(PendingUp {
-                                button,
-                                point,
-                                extra_info,
-                                due,
-                            });
-                            return;
-                        }
+                if !self.closing
+                    && !self.click_delay.is_zero()
+                    && let Some(sent_at) = self.last_down_sent[button.index()]
+                {
+                    let due = sent_at + self.click_delay;
+                    if due > Instant::now() {
+                        self.pending_up = Some(PendingUp {
+                            button,
+                            point,
+                            extra_info,
+                            due,
+                        });
+                        return;
                     }
                 }
                 self.send_up_or_queue(button, point, extra_info);
@@ -603,12 +604,12 @@ impl<S: SendSink> SenderWorker<S> {
     }
 
     fn process_deadlines(&mut self, now: Instant) {
-        if let Some(pending) = &self.pending_up {
-            if now >= pending.due || self.closing {
-                let pending = self.pending_up.take().unwrap();
-                self.send_up_or_queue(pending.button, pending.point, pending.extra_info);
-                self.drain_buttons();
-            }
+        if let Some(pending) = &self.pending_up
+            && (now >= pending.due || self.closing)
+        {
+            let pending = self.pending_up.take().unwrap();
+            self.send_up_or_queue(pending.button, pending.point, pending.extra_info);
+            self.drain_buttons();
         }
 
         if let Some(first) = self.unsent_ups.first()

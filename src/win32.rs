@@ -354,6 +354,7 @@ impl InstanceLock {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .share_mode(0)
                 .open(path)
             {

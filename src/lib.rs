@@ -103,10 +103,11 @@ impl TriggerHost for Win32Host {
     }
 
     fn update_cursor(&mut self, axis: Option<ScrollAxis>) {
-        if self.scroll_window != 0 && self.reported_axis != axis {
-            if win32::post_scroll(self.scroll_window, axis) {
-                self.reported_axis = axis;
-            }
+        if self.scroll_window != 0
+            && self.reported_axis != axis
+            && win32::post_scroll(self.scroll_window, axis)
+        {
+            self.reported_axis = axis;
         }
     }
 

@@ -655,11 +655,7 @@ pub(crate) fn ask_profile_name(
 ) -> Option<String> {
     let mut state = Box::new(ModalState::new(DialogKind::ProfileName, dark, lang));
     state.profile_dir = Some(dir.to_path_buf());
-    let Some((hwnd, dpi)) =
-        spawn_modal_shell(owner, tr(lang, "Add Properties"), 328, 126, &mut state)
-    else {
-        return None;
-    };
+    let (hwnd, dpi) = spawn_modal_shell(owner, tr(lang, "Add Properties"), 328, 126, &mut state)?;
 
     let normal = create_ui_font(dpi, UiFontKind::Normal);
     let nf = normal.as_ref().map_or(null_mut(), |f| f.raw());

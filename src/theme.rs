@@ -1375,14 +1375,14 @@ pub(crate) fn handle_dark_button_custom_draw(
                 let txt_h = focus_rc.bottom - focus_rc.top;
                 let cy = nm.rc.top + (nm.rc.bottom - nm.rc.top - txt_h) / 2;
                 let pad = (2 * dpi as i32 + 48) / 96;
-                let mut draw_focus = ThemeRect {
+                let draw_focus = ThemeRect {
                     left: (focus_rc.left - pad).max(nm.rc.left),
                     top: (cy - pad).max(nm.rc.top),
                     right: (focus_rc.right + pad).min(nm.rc.right),
                     bottom: (cy + txt_h + pad).min(nm.rc.bottom),
                 };
                 unsafe {
-                    DrawFocusRect(hdc, &mut draw_focus);
+                    DrawFocusRect(hdc, &draw_focus);
                 }
             }
 

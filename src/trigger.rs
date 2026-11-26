@@ -1416,13 +1416,15 @@ mod tests {
     }
 
     fn base_engine(trigger: Trigger) -> (TriggerEngine, ResendTags, MockHost) {
-        let mut cfg = Config::default();
-        cfg.first_trigger = trigger;
-        cfg.accel_table = false;
-        cfg.vertical_threshold = 5;
-        cfg.horizontal_threshold = 5;
-        cfg.cursor_change = true;
-        cfg.vh_adjuster_mode = false;
+        let cfg = Config {
+            first_trigger: trigger,
+            accel_table: false,
+            vertical_threshold: 5,
+            horizontal_threshold: 5,
+            cursor_change: true,
+            vh_adjuster_mode: false,
+            ..Config::default()
+        };
         let engine_cfg = EngineConfig::from_config(&cfg, &CustomTableState::default());
         let tags = ResendTags::next_unique();
         (TriggerEngine::new(engine_cfg, tags), tags, MockHost::new())
@@ -1571,14 +1573,16 @@ mod tests {
 
     #[test]
     fn drag_trigger_dragged_lock_vs_click_resend() {
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::RightDrag;
-        cfg.dragged_lock = true;
-        cfg.accel_table = false;
-        cfg.vertical_threshold = 5;
-        cfg.horizontal_threshold = 5;
-        cfg.cursor_change = true;
-        cfg.vh_adjuster_mode = false;
+        let cfg = Config {
+            first_trigger: Trigger::RightDrag,
+            dragged_lock: true,
+            accel_table: false,
+            vertical_threshold: 5,
+            horizontal_threshold: 5,
+            cursor_change: true,
+            vh_adjuster_mode: false,
+            ..Config::default()
+        };
         let tags = ResendTags::next_unique();
         let mut engine = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
@@ -1622,13 +1626,15 @@ mod tests {
 
     #[test]
     fn middle_trigger_modifier_click_and_escape_reset() {
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::Middle;
-        cfg.send_middle_click = true;
-        cfg.accel_table = false;
-        cfg.vertical_threshold = 5;
-        cfg.cursor_change = true;
-        cfg.vh_adjuster_mode = false;
+        let cfg = Config {
+            first_trigger: Trigger::Middle,
+            send_middle_click: true,
+            accel_table: false,
+            vertical_threshold: 5,
+            cursor_change: true,
+            vh_adjuster_mode: false,
+            ..Config::default()
+        };
         let tags = ResendTags::next_unique();
         let mut engine = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
@@ -1670,10 +1676,12 @@ mod tests {
 
     #[test]
     fn keyboard_trigger_pause_key_and_mouse_mutual_exit() {
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::Middle;
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkPause;
+        let cfg = Config {
+            first_trigger: Trigger::Middle,
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkPause,
+            ..Config::default()
+        };
         let tags = ResendTags::next_unique();
         let mut engine = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
@@ -1720,11 +1728,13 @@ mod tests {
         let normal_pt = Point { x: 20, y: 20 };
 
         // 1. RightDrag passes on excluded point without starting scroll or resending click.
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::RightDrag;
-        cfg.dragged_lock = true;
-        cfg.accel_table = false;
-        cfg.vertical_threshold = 5;
+        let mut cfg = Config {
+            first_trigger: Trigger::RightDrag,
+            dragged_lock: true,
+            accel_table: false,
+            vertical_threshold: 5,
+            ..Config::default()
+        };
         let tags = ResendTags::next_unique();
         let mut engine = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default())
@@ -1935,10 +1945,12 @@ mod tests {
         }
 
         // Keyboard trigger: the key passes, and so do its repeats and its up.
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::None;
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            first_trigger: Trigger::None,
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let mut kb = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
             ResendTags::next_unique(),
@@ -1952,9 +1964,11 @@ mod tests {
 
     #[test]
     fn lr_second_down_after_poll_timeout_is_not_a_pair_even_if_the_timer_is_late() {
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::Lr;
-        cfg.poll_timeout = 50;
+        let cfg = Config {
+            first_trigger: Trigger::Lr,
+            poll_timeout: 50,
+            ..Config::default()
+        };
         let tags = ResendTags::next_unique();
         let mut engine = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
@@ -2057,9 +2071,11 @@ mod tests {
 
     #[test]
     fn keyboard_hook_is_off_while_paused() {
-        let mut cfg = Config::default();
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let mut engine = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
             ResendTags::next_unique(),
@@ -2115,9 +2131,11 @@ mod tests {
         assert!(engine.is_scrolling());
 
         // A keyboard scroll goes on.
-        let mut cfg = Config::default();
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let mut kb = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
             ResendTags::next_unique(),
@@ -2195,9 +2213,11 @@ mod tests {
         // The trigger key passed over an excluded window, released with no hook: after the
         // recovery, its first press starts the scroll.
         let excluded_pt = Point { x: 100, y: 100 };
-        let mut cfg = Config::default();
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let matcher = ExclusionList::from_lines(["C:\\Games\\game.exe"]).to_matcher();
         let mut kb = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()).with_exclusions(matcher),
@@ -2261,9 +2281,11 @@ mod tests {
         // The trigger key passed over an excluded window, released while the session was locked:
         // after the unlock, its first press starts the scroll.
         let excluded_pt = Point { x: 100, y: 100 };
-        let mut cfg = Config::default();
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let matcher = ExclusionList::from_lines(["C:\\Games\\game.exe"]).to_matcher();
         let mut kb = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()).with_exclusions(matcher),
@@ -2300,9 +2322,11 @@ mod tests {
         // at the unlock was handled (the hook's events come first): its repeats and its up pass,
         // no scroll starts. The next press is the trigger.
         let excluded_pt = Point { x: 100, y: 100 };
-        let mut cfg = Config::default();
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let matcher = ExclusionList::from_lines(["C:\\Games\\game.exe"]).to_matcher();
         let mut kb = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()).with_exclusions(matcher),
@@ -2343,9 +2367,11 @@ mod tests {
 
     #[test]
     fn a_repeat_passed_with_no_record_passes_its_up_too() {
-        let mut cfg = Config::default();
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let vk = TriggerKey::VkLmenu.vk_code();
         let mut kb = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
@@ -2378,9 +2404,11 @@ mod tests {
         );
         assert!(!host.take_calls().iter().any(|c| matches!(c, HostCall::Click(..))));
 
-        let mut cfg = Config::default();
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let vk = TriggerKey::VkLmenu.vk_code();
 
         // A load with the trigger key held (the hook replaced seamlessly: no engine call) ends its
@@ -2413,9 +2441,11 @@ mod tests {
 
     #[test]
     fn installed_keyboard_hook_passes_held_trigger_key() {
-        let mut cfg = Config::default();
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let vk = TriggerKey::VkLmenu.vk_code();
         let mut kb = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
@@ -2446,10 +2476,12 @@ mod tests {
 
     /// The keyboard trigger on `target`, the mouse trigger on Middle (scroll_locktime 200 ms)
     fn kb_engine(target: TriggerKey) -> (TriggerEngine, MockHost, u32) {
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::Middle;
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = target;
+        let cfg = Config {
+            first_trigger: Trigger::Middle,
+            keyboard_hook: true,
+            target_vk_code: target,
+            ..Config::default()
+        };
         let engine = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
             ResendTags::next_unique(),
@@ -2581,10 +2613,12 @@ mod tests {
         use crate::exclusions::ExclusionList;
 
         let excluded_pt = Point { x: 100, y: 100 };
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::Middle;
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkPause;
+        let cfg = Config {
+            first_trigger: Trigger::Middle,
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkPause,
+            ..Config::default()
+        };
         let matcher = ExclusionList::from_lines(["C:\\Games\\game.exe"]).to_matcher();
         let mut kb = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()).with_exclusions(matcher),
@@ -2633,10 +2667,12 @@ mod tests {
 
     /// The mouse trigger on LR, the keyboard trigger on Left Alt
     fn lr_kb_engine() -> (TriggerEngine, MockHost, u32) {
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::Lr;
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            first_trigger: Trigger::Lr,
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let engine = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
             ResendTags::next_unique(),
@@ -2827,8 +2863,10 @@ mod tests {
         // wait (Right's down resent before it), as for any passed press, not passed as the up of
         // the old resent down with Right still waiting
         let excluded_pt = Point { x: 100, y: 100 };
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::Lr;
+        let cfg = Config {
+            first_trigger: Trigger::Lr,
+            ..Config::default()
+        };
         let matcher = ExclusionList::from_lines(["C:\\Games\\game.exe"]).to_matcher();
         let mut engine = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()).with_exclusions(matcher),
@@ -2889,13 +2927,15 @@ mod tests {
 
     /// RightDrag, with draggedLock as given (thresholds 5)
     fn drag_engine(dragged_lock: bool) -> (TriggerEngine, ResendTags, MockHost) {
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::RightDrag;
-        cfg.dragged_lock = dragged_lock;
-        cfg.accel_table = false;
-        cfg.vertical_threshold = 5;
-        cfg.horizontal_threshold = 5;
-        cfg.vh_adjuster_mode = false;
+        let cfg = Config {
+            first_trigger: Trigger::RightDrag,
+            dragged_lock,
+            accel_table: false,
+            vertical_threshold: 5,
+            horizontal_threshold: 5,
+            vh_adjuster_mode: false,
+            ..Config::default()
+        };
         let tags = ResendTags::next_unique();
         let engine = TriggerEngine::new(EngineConfig::from_config(&cfg, &CustomTableState::default()), tags);
         (engine, tags, MockHost::new())
