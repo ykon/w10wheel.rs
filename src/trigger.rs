@@ -839,10 +839,15 @@ impl TriggerEngine {
             if self.up_owners.get(btn) == UpOwner::Resent || self.tracker.would_drop_lone_up(btn) {
                 return true;
             }
+            // The up of another button whose down reached the application (another button than
+            // the pair's, the other of the pair passed over an excluded window, the other button
+            // of the Left or Right trigger): the wait ends, its down resent at once, and the up
+            // passes as it is, a little before that down (another button: no harm). Not resent
+            // after it: the button pressed again before the sender sent it would have its down
+            // (passed at once) before that up (down, down, up). As .NET (24dfb4e, 11a7b45).
             self.end_lr_wait(host);
             self.resend_waiting_down(wait, host);
-            host.send_up(btn, point, self.tags.encode(ResendKind::Plain, 0));
-            return false;
+            return true;
         }
 
         if self.up_owners.get(btn) == UpOwner::Trigger {
@@ -2860,8 +2865,8 @@ mod tests {
 
         // LR: the wait of Left timed out (resent), its up missed, another button between; Left
         // pressed again over an excluded window (passed), then Right waits: Left's up ends the
-        // wait (Right's down resent before it), as for any passed press, not passed as the up of
-        // the old resent down with Right still waiting
+        // wait (Right's down resent at once) and passes, as for any passed press; not passed as
+        // the up of the old resent down with Right still waiting (no down resent)
         let excluded_pt = Point { x: 100, y: 100 };
         let cfg = Config {
             first_trigger: Trigger::Lr,
@@ -2887,15 +2892,11 @@ mod tests {
         host.take_calls();
         assert_eq!(
             engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Left), 20, 20, 650), &mut host),
-            HookDecision::Suppress
+            HookDecision::Pass
         );
         assert!(matches!(
             host.take_calls().as_slice(),
-            [
-                HostCall::KillTimer,
-                HostCall::Down(MouseButton::Right, _, _),
-                HostCall::Up(MouseButton::Left, _, _)
-            ]
+            [HostCall::KillTimer, HostCall::Down(MouseButton::Right, _, _)]
         ));
     }
 
@@ -3031,5 +3032,59 @@ mod tests {
         assert!(engine.is_scrolling());
         engine.handle_mouse(phys_mouse(HookMouseKind::Up(right), 0, 0, 2450), &mut host);
         assert!(!engine.is_scrolling());
+    }
+
+    #[test]
+    fn an_up_whose_down_passed_ends_the_lr_wait_and_passes_as_it_is() {
+        use crate::exclusions::ExclusionList;
+
+        // The waiting down is resent at once; the up passes as it is (not resent after that
+        // down: the button pressed again before the sender sent it would have its down first)
+        fn ends_and_passes(engine: &mut TriggerEngine, host: &mut MockHost, btn: MouseButton, waiting: MouseButton) {
+            host.take_calls();
+            assert_eq!(
+                engine.handle_mouse(phys_mouse(HookMouseKind::Up(btn), 20, 20, 300), host),
+                HookDecision::Pass
+            );
+            let calls = host.take_calls();
+            assert!(
+                matches!(calls.as_slice(), [HostCall::KillTimer, HostCall::Down(b, _, _)] if *b == waiting),
+                "{calls:?}"
+            );
+            // Pressed again at once: its down passes, after its up
+            assert_eq!(
+                engine.handle_mouse(phys_mouse(HookMouseKind::Down(btn), 20, 20, 310), host),
+                HookDecision::Pass
+            );
+        }
+
+        // Another button than the pair's (X1), pressed before the wait
+        let (mut engine, _tags, mut host) = base_engine(Trigger::Lr);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::X1), 20, 20, 100), &mut host);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 10, 10, 200), &mut host);
+        ends_and_passes(&mut engine, &mut host, MouseButton::X1, MouseButton::Left);
+
+        // The other button of the pair, its down passed over an excluded window
+        let excluded_pt = Point { x: 20, y: 20 };
+        let cfg = Config {
+            first_trigger: Trigger::Lr,
+            ..Config::default()
+        };
+        let matcher = ExclusionList::from_lines(["C:\\Games\\game.exe"]).to_matcher();
+        let mut engine = TriggerEngine::new(
+            EngineConfig::from_config(&cfg, &CustomTableState::default()).with_exclusions(matcher),
+            ResendTags::next_unique(),
+        );
+        let mut host = MockHost::new();
+        host.excluded_points.push(excluded_pt);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Right), 20, 20, 100), &mut host);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 10, 10, 200), &mut host);
+        ends_and_passes(&mut engine, &mut host, MouseButton::Right, MouseButton::Left);
+
+        // The Left trigger's other button (Right), pressed before the wait (not the trigger's)
+        let (mut engine, _tags, mut host) = base_engine(Trigger::Left);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Right), 20, 20, 100), &mut host);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 10, 10, 200), &mut host);
+        ends_and_passes(&mut engine, &mut host, MouseButton::Right, MouseButton::Left);
     }
 }
