@@ -111,7 +111,7 @@ Java 版・.NET 版 2.10.0 と同じ機能・設定ファイル・コマンド�
   - **判定**: `WindowFromPoint` と `GetAncestor(GA_ROOT)` でカーソル下と親のトップレベルウィンドウのプロセスの実行ファイル（`QueryFullProcessImageNameW`）を取得し、`RtlUpcaseUnicodeChar` で大文字小文字を区別せずに比較します（WebView2 など別プロセスの子ウィンドウにも対応、除外リストが空なら判定しません）。
 - **トリガー・入力**:
   - **マウスのトリガー（12 種類）**: `LR` / `Left` / `Right`（`pollTimeout` の同時押し判定）、`Middle` / `X1` / `X2`（`scrollLocktime` による固定、`sendMiddleClick`）、`LeftDrag` / `RightDrag` / `MiddleDrag` / `X1Drag` / `X2Drag`（`draggedLock`、動かさずに離したらクリックを再送）、`None`。
-  - **キーボードトリガー**: `WH_KEYBOARD_LL` による 23 キーから選択、`VK_PAUSE` の扱い、マウスとキーボードのトリガーの相互キャンセル。他のソフトが送ったキーは扱いません。
+  - **キーボードトリガー**: `WH_KEYBOARD_LL` による 23 キーから選択（押し続けた時のリピートは抑止。`VK_PAUSE` も他のキーと同じ）、マウスとキーボードのトリガーの相互キャンセル。他のソフトが送ったキーは扱いません。
   - **入力の送信**: `dwExtraInfo` にタグを付けた送信（クリックの間隔、送れなかった Up の再送、重複や単独の Up の抑止）、Escape を押しながらのクリックで状態を初期化。
 - **スクロール**:
   - **通常のモードと加速テーブル**: `accelTable`, `accelMultiplier`（`M5`〜`M9`）, `customAccelTable` / `customAccelThreshold` / `customAccelMultiplier`, `verticalThreshold`, `horizontalThreshold`
