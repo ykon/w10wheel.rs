@@ -2,7 +2,7 @@ use crate::config::{Config, CustomTableState, Trigger, TriggerKey};
 use crate::exclusions::ExclusionMatcher;
 use crate::properties::ConfigStore;
 use crate::scroll::{ScrollAxis, ScrollConfig, ScrollSession, WheelEvent};
-use crate::sender::{KIND_DOWN, KIND_PLAIN, KIND_RELEASE, MouseButton, PRESS_ID_MASK, Point, ResendTags, ResentInfo};
+use crate::sender::{MouseButton, PRESS_ID_MASK, Point, ResendKind, ResendTags, ResentInfo};
 
 const KEY_COUNT: usize = 256;
 
@@ -149,7 +149,7 @@ struct Press {
     /// Its up has passed (or was dropped as a lone up, or may have been missed): a down of it
     /// resent later is dropped
     up_passed: bool,
-    /// The id of the press whose resent up (KIND_RELEASE) is queued, 0 when none is
+    /// The id of the press whose resent up (ResendKind::Release) is queued, 0 when none is
     release_queued_id: u32,
 }
 
@@ -168,11 +168,11 @@ impl ButtonTracker {
         &mut self.presses[button.index()]
     }
 
-    fn drop_resent(&self, button: MouseButton, is_down: bool, kind: usize, press_id: u32) -> bool {
+    fn drop_resent(&self, button: MouseButton, is_down: bool, kind: ResendKind, press_id: u32) -> bool {
         let p = self.press(button);
         match (is_down, kind) {
-            (true, KIND_DOWN) => (press_id != p.id || p.up_passed) && press_id != p.release_queued_id,
-            (false, KIND_RELEASE) => press_id != p.down_passed_id,
+            (true, ResendKind::Down) => (press_id != p.id || p.up_passed) && press_id != p.release_queued_id,
+            (false, ResendKind::Release) => press_id != p.down_passed_id,
             _ => false,
         }
     }
@@ -228,32 +228,35 @@ impl ButtonTracker {
         self.press_mut(button).release_queued_id = press_id;
     }
 
-    fn on_after_mouse(
-        &mut self,
-        button: MouseButton,
-        is_down: bool,
-        injected: bool,
-        kind: usize,
-        press_id: u32,
-        passed: bool,
-    ) {
+    /// After a physical event, passed or suppressed
+    fn on_after_physical(&mut self, button: MouseButton, is_down: bool, passed: bool) {
         let p = self.press_mut(button);
-        if !injected && is_down && !passed {
-            p.down_suppressed = true;
-            return;
+        match (is_down, passed) {
+            (true, true) => p.down_passed_id = p.id,
+            (true, false) => p.down_suppressed = true,
+            (false, true) => p.on_up_passed(),
+            (false, false) => {}
         }
-        if passed {
-            if is_down && kind == KIND_DOWN && injected {
-                p.down_passed_id = press_id;
-            } else if is_down && !injected {
-                p.down_passed_id = p.id;
-            } else if !is_down && (!injected || kind == KIND_RELEASE) {
-                p.down_passed_id = 0;
-                p.up_passed = true;
-                p.down_suppressed = false;
-                p.release_queued_id = 0;
-            }
+    }
+
+    /// After a resent event of ours that passed (one dropped by drop_resent did not)
+    fn on_after_resent(&mut self, button: MouseButton, is_down: bool, kind: ResendKind, press_id: u32) {
+        let p = self.press_mut(button);
+        match (is_down, kind) {
+            (true, ResendKind::Down) => p.down_passed_id = press_id,
+            (false, ResendKind::Release) => p.on_up_passed(),
+            _ => {}
         }
+    }
+}
+
+impl Press {
+    /// The up of the press reached the application: nothing of it is left down there
+    fn on_up_passed(&mut self) {
+        self.down_passed_id = 0;
+        self.up_passed = true;
+        self.down_suppressed = false;
+        self.release_queued_id = 0;
     }
 }
 
@@ -352,58 +355,73 @@ struct LrWait {
     time: u32,
 }
 
+/// The trigger that started a scroll, and what is kept of it until its up
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ScrollOwner {
-    MouseButton(MouseButton),
-    MouseDouble,
+enum ScrollKind {
+    /// A single trigger (Middle, X1, X2): its up releases the scroll within the locktime
+    Single(MouseButton),
+    /// A drag trigger: its up releases the scroll if it moved (draggedLock), or ends it (with the
+    /// click resent if it did not)
+    Drag {
+        button: MouseButton,
+        start: Point,
+        /// A move away from the start seen by the hook while pressed, or a scroll
+        moved: bool,
+    },
+    /// The pair of the LR, Left and Right triggers: the second up releases the scroll within the
+    /// locktime
+    Double { first_up_seen: bool },
+    /// The keyboard trigger: its up releases the scroll within the locktime
     Keyboard,
 }
 
+impl ScrollKind {
+    /// The button of a single or drag trigger
+    fn button(self) -> Option<MouseButton> {
+        match self {
+            Self::Single(button) | Self::Drag { button, .. } => Some(button),
+            Self::Double { .. } | Self::Keyboard => None,
+        }
+    }
+}
+
 struct ActiveScroll {
-    owner: ScrollOwner,
-    is_drag_trigger: bool,
-    drag_start: Point,
+    kind: ScrollKind,
+    /// The trigger was released within the locktime (or after a drag, draggedLock): the scroll
+    /// goes on until a next down
     released: bool,
+    /// The time of the trigger's down: an earlier move (Raw Input) is not of the scroll
     started_at: u32,
-    second_trigger_up: bool,
-    dragged: bool,
-    scrolled: bool,
     session: ScrollSession,
 }
 
 impl ActiveScroll {
-    fn new_immediate(owner: ScrollOwner, started_at: u32, config: &ScrollConfig) -> Self {
+    fn new_immediate(kind: ScrollKind, started_at: u32, config: &ScrollConfig) -> Self {
         let mut session = ScrollSession::new(config);
         session.on_immediate_scroll_start(config);
         Self {
-            owner,
-            is_drag_trigger: false,
-            drag_start: Point::default(),
+            kind,
             released: false,
             started_at,
-            second_trigger_up: false,
-            dragged: false,
-            scrolled: false,
             session,
         }
     }
 
-    fn new_drag(button: MouseButton, drag_start: Point, started_at: u32, config: &ScrollConfig) -> Self {
+    fn new_drag(button: MouseButton, start: Point, started_at: u32, config: &ScrollConfig) -> Self {
         Self {
-            owner: ScrollOwner::MouseButton(button),
-            is_drag_trigger: true,
-            drag_start,
+            kind: ScrollKind::Drag {
+                button,
+                start,
+                moved: false,
+            },
             released: false,
             started_at,
-            second_trigger_up: false,
-            dragged: false,
-            scrolled: false,
             session: ScrollSession::new(config),
         }
     }
 
-    fn dragged_or_scrolled(&self) -> bool {
-        self.dragged || self.scrolled
+    fn is_keyboard(&self) -> bool {
+        self.kind == ScrollKind::Keyboard
     }
 }
 
@@ -559,25 +577,19 @@ impl TriggerEngine {
         }
         if let Some(wait) = self.lr_wait {
             if !event.injected && event.point != wait.point {
-                self.lr_wait = None;
-                host.kill_poll_timer();
-                self.up_owners.set(wait.button, UpOwner::Resent);
-                host.send_down(
-                    wait.button,
-                    wait.point,
-                    self.tags.encode(KIND_DOWN, wait.press_id),
-                );
+                self.end_lr_wait(host);
+                self.resend_waiting_down(wait, host);
                 return false;
             }
             return true;
         }
         if let Some(scroll) = &mut self.scroll {
             if !scroll.released
-                && scroll.is_drag_trigger
+                && let ScrollKind::Drag { start, moved, .. } = &mut scroll.kind
                 && !event.injected
-                && event.point != scroll.drag_start
+                && event.point != *start
             {
-                scroll.dragged = true;
+                *moved = true;
                 scroll.session.on_drag_cursor_move(&self.config.scroll);
                 self.sync_cursor(host);
             }
@@ -600,8 +612,7 @@ impl TriggerEngine {
                     if self.tracker.drop_resent(btn, is_down, kind, press_id) {
                         false
                     } else {
-                        self.tracker
-                            .on_after_mouse(btn, is_down, true, kind, press_id, true);
+                        self.tracker.on_after_resent(btn, is_down, kind, press_id);
                         true
                     }
                 }
@@ -646,11 +657,11 @@ impl TriggerEngine {
                 if owner == UpOwner::Resent {
                     let press_id = self.tracker.current_press_id(btn);
                     self.tracker.mark_release_queued(btn, press_id);
-                    host.send_up(btn, point, self.tags.encode(KIND_RELEASE, press_id));
+                    host.send_up(btn, point, self.tags.encode(ResendKind::Release, press_id));
                 }
             }
         }
-        self.tracker.on_after_mouse(btn, is_down, false, 0, 0, passed);
+        self.tracker.on_after_physical(btn, is_down, passed);
         passed
     }
 
@@ -663,17 +674,15 @@ impl TriggerEngine {
     ) -> bool {
         if let Some(wait) = self.lr_wait {
             if btn == wait.button {
-                self.lr_wait = None;
-                host.kill_poll_timer();
+                self.end_lr_wait(host);
             } else if self.is_second_double_button(btn, wait.button) {
-                self.lr_wait = None;
-                host.kill_poll_timer();
+                self.end_lr_wait(host);
                 self.up_owners.set(wait.button, UpOwner::Trigger);
                 self.up_owners.set(btn, UpOwner::Trigger);
                 if self.is_released_scroll() || self.is_keyboard_scroll() {
                     self.exit_scroll(host);
                 } else if !self.start_scroll(
-                    ActiveScroll::new_immediate(ScrollOwner::MouseDouble, time, &self.config.scroll),
+                    ActiveScroll::new_immediate(ScrollKind::Double { first_up_seen: false }, time, &self.config.scroll),
                     host,
                 ) {
                     // Scroll mode could not start (Raw Input refused): both downs are resent in
@@ -684,19 +693,13 @@ impl TriggerEngine {
                         [(wait.button, wait.point, wait.press_id), (btn, point, press_id)]
                     {
                         self.up_owners.set(button, UpOwner::Resent);
-                        host.send_down(button, at, self.tags.encode(KIND_DOWN, id));
+                        host.send_down(button, at, self.tags.encode(ResendKind::Down, id));
                     }
                 }
                 return false;
             } else {
-                self.lr_wait = None;
-                host.kill_poll_timer();
-                self.up_owners.set(wait.button, UpOwner::Resent);
-                host.send_down(
-                    wait.button,
-                    wait.point,
-                    self.tags.encode(KIND_DOWN, wait.press_id),
-                );
+                self.end_lr_wait(host);
+                self.resend_waiting_down(wait, host);
             }
         }
 
@@ -772,7 +775,7 @@ impl TriggerEngine {
                 return false;
             }
             let scroll = ActiveScroll::new_immediate(
-                ScrollOwner::MouseButton(btn),
+                ScrollKind::Single(btn),
                 time,
                 &self.config.scroll,
             );
@@ -816,8 +819,7 @@ impl TriggerEngine {
     ) -> bool {
         if let Some(wait) = self.lr_wait {
             if btn == wait.button {
-                self.lr_wait = None;
-                host.kill_poll_timer();
+                self.end_lr_wait(host);
                 if point == wait.point {
                     host.send_click(btn, point, self.tags.click_tag());
                 } else {
@@ -825,7 +827,7 @@ impl TriggerEngine {
                         btn,
                         wait.point,
                         point,
-                        self.tags.encode(KIND_PLAIN, 0),
+                        self.tags.encode(ResendKind::Plain, 0),
                     );
                 }
                 return false;
@@ -837,15 +839,9 @@ impl TriggerEngine {
             if self.up_owners.get(btn) == UpOwner::Resent || self.tracker.would_drop_lone_up(btn) {
                 return true;
             }
-            self.lr_wait = None;
-            host.kill_poll_timer();
-            self.up_owners.set(wait.button, UpOwner::Resent);
-            host.send_down(
-                wait.button,
-                wait.point,
-                self.tags.encode(KIND_DOWN, wait.press_id),
-            );
-            host.send_up(btn, point, self.tags.encode(KIND_PLAIN, 0));
+            self.end_lr_wait(host);
+            self.resend_waiting_down(wait, host);
+            host.send_up(btn, point, self.tags.encode(ResendKind::Plain, 0));
             return false;
         }
 
@@ -870,30 +866,31 @@ impl TriggerEngine {
         if scroll.released {
             return;
         }
-        match scroll.owner {
-            ScrollOwner::MouseDouble if btn.is_lr() => {
-                if !scroll.second_trigger_up {
-                    scroll.second_trigger_up = true;
-                } else if time.wrapping_sub(scroll.started_at) <= self.config.trigger.scroll_locktime_ms
-                {
+        let within_locktime =
+            time.wrapping_sub(scroll.started_at) <= self.config.trigger.scroll_locktime_ms;
+        match &mut scroll.kind {
+            ScrollKind::Double { first_up_seen } if btn.is_lr() => {
+                if !*first_up_seen {
+                    *first_up_seen = true;
+                } else if within_locktime {
                     scroll.released = true;
                 } else {
                     self.exit_scroll(host);
                 }
             }
-            ScrollOwner::MouseButton(owner_btn) if owner_btn == btn => {
-                if scroll.is_drag_trigger {
-                    let dragged = scroll.dragged_or_scrolled();
-                    if dragged && self.config.trigger.dragged_lock {
-                        scroll.released = true;
-                    } else {
-                        self.exit_scroll(host);
-                        if !dragged {
-                            host.send_click(btn, point, self.tags.click_tag());
-                        }
+            ScrollKind::Drag { button, moved, .. } if *button == btn => {
+                let moved = *moved;
+                if moved && self.config.trigger.dragged_lock {
+                    scroll.released = true;
+                } else {
+                    self.exit_scroll(host);
+                    if !moved {
+                        host.send_click(btn, point, self.tags.click_tag());
                     }
-                } else if time.wrapping_sub(scroll.started_at) <= self.config.trigger.scroll_locktime_ms
-                {
+                }
+            }
+            ScrollKind::Single(button) if *button == btn => {
+                if within_locktime {
                     scroll.released = true;
                 } else {
                     self.exit_scroll(host);
@@ -963,7 +960,7 @@ impl TriggerEngine {
                         return true;
                     }
                     let scroll = ActiveScroll::new_immediate(
-                        ScrollOwner::Keyboard,
+                        ScrollKind::Keyboard,
                         event.time,
                         &self.config.scroll,
                     );
@@ -1039,11 +1036,24 @@ impl TriggerEngine {
         if self.paused {
             return;
         }
+        self.resend_waiting_down(wait, host);
+    }
+
+    /// Ends the LR wait, if any, and its timer: its down is not resent
+    fn end_lr_wait(&mut self, host: &mut impl TriggerHost) {
+        if self.lr_wait.take().is_some() {
+            host.kill_poll_timer();
+        }
+    }
+
+    /// The down of the LR wait, ended with no pair, resent alone: its up passes (or its release is
+    /// resent, if the up is dropped as a lone up)
+    fn resend_waiting_down(&mut self, wait: LrWait, host: &mut impl TriggerHost) {
         self.up_owners.set(wait.button, UpOwner::Resent);
         host.send_down(
             wait.button,
             wait.point,
-            self.tags.encode(KIND_DOWN, wait.press_id),
+            self.tags.encode(ResendKind::Down, wait.press_id),
         );
     }
 
@@ -1059,7 +1069,9 @@ impl TriggerEngine {
         }
         let events = scroll.session.process_raw_motion(dx, dy, &self.config.scroll);
         if !events.is_empty() {
-            scroll.scrolled = true;
+            if let ScrollKind::Drag { moved, .. } = &mut scroll.kind {
+                *moved = true;
+            }
             scroll.session.on_drag_cursor_move(&self.config.scroll);
         }
         self.sync_cursor(host);
@@ -1171,8 +1183,8 @@ impl TriggerEngine {
 
     /// Ends the LR wait and the scroll, and forgets the records, as `reset` tells (see Reset)
     fn reset(&mut self, reset: Reset, host: &mut impl TriggerHost) {
-        if reset.mouse != MouseRecords::Keep && self.lr_wait.take().is_some() {
-            host.kill_poll_timer();
+        if reset.mouse != MouseRecords::Keep {
+            self.end_lr_wait(host);
         }
         let ends_scroll = match reset.scroll {
             EndScroll::Mouse => self.is_mouse_scroll(),
@@ -1243,34 +1255,24 @@ impl TriggerEngine {
     }
 
     fn is_keyboard_scroll(&self) -> bool {
-        self.scroll
-            .as_ref()
-            .is_some_and(|s| s.owner == ScrollOwner::Keyboard)
+        self.scroll.as_ref().is_some_and(ActiveScroll::is_keyboard)
     }
 
     fn is_pressed_keyboard_scroll(&self) -> bool {
-        self.scroll
-            .as_ref()
-            .is_some_and(|s| !s.released && s.owner == ScrollOwner::Keyboard)
+        self.scroll.as_ref().is_some_and(|s| !s.released && s.is_keyboard())
     }
 
     fn is_mouse_scroll(&self) -> bool {
-        self.scroll
-            .as_ref()
-            .is_some_and(|s| s.owner != ScrollOwner::Keyboard)
+        self.scroll.as_ref().is_some_and(|s| !s.is_keyboard())
     }
 
     /// The scroll mode was started by this button as the single or drag trigger
     fn is_single_scroll_owner(&self, btn: MouseButton) -> bool {
-        self.scroll
-            .as_ref()
-            .is_some_and(|s| s.owner == ScrollOwner::MouseButton(btn))
+        self.scroll.as_ref().is_some_and(|s| s.kind.button() == Some(btn))
     }
 
     fn is_pressed_mouse_scroll(&self) -> bool {
-        self.scroll
-            .as_ref()
-            .is_some_and(|s| !s.released && s.owner != ScrollOwner::Keyboard)
+        self.scroll.as_ref().is_some_and(|s| !s.released && !s.is_keyboard())
     }
 
     fn is_first_double_button(&self, btn: MouseButton) -> bool {
@@ -1414,13 +1416,15 @@ mod tests {
     }
 
     fn base_engine(trigger: Trigger) -> (TriggerEngine, ResendTags, MockHost) {
-        let mut cfg = Config::default();
-        cfg.first_trigger = trigger;
-        cfg.accel_table = false;
-        cfg.vertical_threshold = 5;
-        cfg.horizontal_threshold = 5;
-        cfg.cursor_change = true;
-        cfg.vh_adjuster_mode = false;
+        let cfg = Config {
+            first_trigger: trigger,
+            accel_table: false,
+            vertical_threshold: 5,
+            horizontal_threshold: 5,
+            cursor_change: true,
+            vh_adjuster_mode: false,
+            ..Config::default()
+        };
         let engine_cfg = EngineConfig::from_config(&cfg, &CustomTableState::default());
         let tags = ResendTags::next_unique();
         (TriggerEngine::new(engine_cfg, tags), tags, MockHost::new())
@@ -1507,7 +1511,7 @@ mod tests {
             other => panic!("unexpected timeout calls: {other:?}"),
         };
 
-        // Simulate physical Up arriving BEFORE resent KIND_DOWN reaches the hook.
+        // Simulate physical Up arriving BEFORE resent ResendKind::Down reaches the hook.
         assert_eq!(
             engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Left), 50, 60, 310), &mut host),
             HookDecision::Suppress
@@ -1520,12 +1524,12 @@ mod tests {
         assert_eq!(
             tags.decode(rel_extra),
             Some(ResentInfo::Button {
-                kind: KIND_RELEASE,
+                kind: ResendKind::Release,
                 press_id: 1
             })
         );
 
-        // Both KIND_DOWN(1) and KIND_RELEASE(1) must now be allowed to pass.
+        // Both ResendKind::Down(1) and ResendKind::Release(1) must now be allowed to pass.
         assert_eq!(
             engine.handle_mouse(
                 inj_mouse(HookMouseKind::Down(MouseButton::Left), 50, 60, 311, down_extra),
@@ -1569,14 +1573,16 @@ mod tests {
 
     #[test]
     fn drag_trigger_dragged_lock_vs_click_resend() {
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::RightDrag;
-        cfg.dragged_lock = true;
-        cfg.accel_table = false;
-        cfg.vertical_threshold = 5;
-        cfg.horizontal_threshold = 5;
-        cfg.cursor_change = true;
-        cfg.vh_adjuster_mode = false;
+        let cfg = Config {
+            first_trigger: Trigger::RightDrag,
+            dragged_lock: true,
+            accel_table: false,
+            vertical_threshold: 5,
+            horizontal_threshold: 5,
+            cursor_change: true,
+            vh_adjuster_mode: false,
+            ..Config::default()
+        };
         let tags = ResendTags::next_unique();
         let mut engine = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
@@ -1620,13 +1626,15 @@ mod tests {
 
     #[test]
     fn middle_trigger_modifier_click_and_escape_reset() {
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::Middle;
-        cfg.send_middle_click = true;
-        cfg.accel_table = false;
-        cfg.vertical_threshold = 5;
-        cfg.cursor_change = true;
-        cfg.vh_adjuster_mode = false;
+        let cfg = Config {
+            first_trigger: Trigger::Middle,
+            send_middle_click: true,
+            accel_table: false,
+            vertical_threshold: 5,
+            cursor_change: true,
+            vh_adjuster_mode: false,
+            ..Config::default()
+        };
         let tags = ResendTags::next_unique();
         let mut engine = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
@@ -1668,10 +1676,12 @@ mod tests {
 
     #[test]
     fn keyboard_trigger_pause_key_and_mouse_mutual_exit() {
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::Middle;
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkPause;
+        let cfg = Config {
+            first_trigger: Trigger::Middle,
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkPause,
+            ..Config::default()
+        };
         let tags = ResendTags::next_unique();
         let mut engine = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
@@ -1718,11 +1728,13 @@ mod tests {
         let normal_pt = Point { x: 20, y: 20 };
 
         // 1. RightDrag passes on excluded point without starting scroll or resending click.
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::RightDrag;
-        cfg.dragged_lock = true;
-        cfg.accel_table = false;
-        cfg.vertical_threshold = 5;
+        let mut cfg = Config {
+            first_trigger: Trigger::RightDrag,
+            dragged_lock: true,
+            accel_table: false,
+            vertical_threshold: 5,
+            ..Config::default()
+        };
         let tags = ResendTags::next_unique();
         let mut engine = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default())
@@ -1911,15 +1923,15 @@ mod tests {
         assert_eq!(
             downs,
             vec![
-                (MouseButton::Left, Some(ResentInfo::Button { kind: KIND_DOWN, press_id: 1 })),
-                (MouseButton::Right, Some(ResentInfo::Button { kind: KIND_DOWN, press_id: 2 })),
+                (MouseButton::Left, Some(ResentInfo::Button { kind: ResendKind::Down, press_id: 1 })),
+                (MouseButton::Right, Some(ResentInfo::Button { kind: ResendKind::Down, press_id: 2 })),
             ]
         );
         // The resent downs reach the hook, then the physical ups pass (releasing them).
         for (btn, id) in [(MouseButton::Left, 1), (MouseButton::Right, 2)] {
             assert_eq!(
                 engine.handle_mouse(
-                    inj_mouse(HookMouseKind::Down(btn), 1, 2, 121, tags.encode(KIND_DOWN, id)),
+                    inj_mouse(HookMouseKind::Down(btn), 1, 2, 121, tags.encode(ResendKind::Down, id)),
                     &mut host
                 ),
                 HookDecision::Pass
@@ -1933,10 +1945,12 @@ mod tests {
         }
 
         // Keyboard trigger: the key passes, and so do its repeats and its up.
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::None;
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            first_trigger: Trigger::None,
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let mut kb = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
             ResendTags::next_unique(),
@@ -1950,9 +1964,11 @@ mod tests {
 
     #[test]
     fn lr_second_down_after_poll_timeout_is_not_a_pair_even_if_the_timer_is_late() {
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::Lr;
-        cfg.poll_timeout = 50;
+        let cfg = Config {
+            first_trigger: Trigger::Lr,
+            poll_timeout: 50,
+            ..Config::default()
+        };
         let tags = ResendTags::next_unique();
         let mut engine = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
@@ -1973,13 +1989,13 @@ mod tests {
             host.take_calls(),
             vec![
                 HostCall::KillTimer,
-                HostCall::Down(MouseButton::Left, Point { x: 5, y: 5 }, tags.encode(KIND_DOWN, 1)),
+                HostCall::Down(MouseButton::Left, Point { x: 5, y: 5 }, tags.encode(ResendKind::Down, 1)),
                 HostCall::SetTimer(50),
             ]
         );
         // The left up is released as that of a resent down
         engine.handle_mouse(
-            inj_mouse(HookMouseKind::Down(MouseButton::Left), 5, 5, 1081, tags.encode(KIND_DOWN, 1)),
+            inj_mouse(HookMouseKind::Down(MouseButton::Left), 5, 5, 1081, tags.encode(ResendKind::Down, 1)),
             &mut host,
         );
         assert_eq!(
@@ -2055,9 +2071,11 @@ mod tests {
 
     #[test]
     fn keyboard_hook_is_off_while_paused() {
-        let mut cfg = Config::default();
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let mut engine = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
             ResendTags::next_unique(),
@@ -2113,9 +2131,11 @@ mod tests {
         assert!(engine.is_scrolling());
 
         // A keyboard scroll goes on.
-        let mut cfg = Config::default();
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let mut kb = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
             ResendTags::next_unique(),
@@ -2193,9 +2213,11 @@ mod tests {
         // The trigger key passed over an excluded window, released with no hook: after the
         // recovery, its first press starts the scroll.
         let excluded_pt = Point { x: 100, y: 100 };
-        let mut cfg = Config::default();
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let matcher = ExclusionList::from_lines(["C:\\Games\\game.exe"]).to_matcher();
         let mut kb = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()).with_exclusions(matcher),
@@ -2259,9 +2281,11 @@ mod tests {
         // The trigger key passed over an excluded window, released while the session was locked:
         // after the unlock, its first press starts the scroll.
         let excluded_pt = Point { x: 100, y: 100 };
-        let mut cfg = Config::default();
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let matcher = ExclusionList::from_lines(["C:\\Games\\game.exe"]).to_matcher();
         let mut kb = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()).with_exclusions(matcher),
@@ -2298,9 +2322,11 @@ mod tests {
         // at the unlock was handled (the hook's events come first): its repeats and its up pass,
         // no scroll starts. The next press is the trigger.
         let excluded_pt = Point { x: 100, y: 100 };
-        let mut cfg = Config::default();
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let matcher = ExclusionList::from_lines(["C:\\Games\\game.exe"]).to_matcher();
         let mut kb = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()).with_exclusions(matcher),
@@ -2341,9 +2367,11 @@ mod tests {
 
     #[test]
     fn a_repeat_passed_with_no_record_passes_its_up_too() {
-        let mut cfg = Config::default();
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let vk = TriggerKey::VkLmenu.vk_code();
         let mut kb = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
@@ -2376,9 +2404,11 @@ mod tests {
         );
         assert!(!host.take_calls().iter().any(|c| matches!(c, HostCall::Click(..))));
 
-        let mut cfg = Config::default();
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let vk = TriggerKey::VkLmenu.vk_code();
 
         // A load with the trigger key held (the hook replaced seamlessly: no engine call) ends its
@@ -2411,9 +2441,11 @@ mod tests {
 
     #[test]
     fn installed_keyboard_hook_passes_held_trigger_key() {
-        let mut cfg = Config::default();
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let vk = TriggerKey::VkLmenu.vk_code();
         let mut kb = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
@@ -2444,10 +2476,12 @@ mod tests {
 
     /// The keyboard trigger on `target`, the mouse trigger on Middle (scroll_locktime 200 ms)
     fn kb_engine(target: TriggerKey) -> (TriggerEngine, MockHost, u32) {
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::Middle;
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = target;
+        let cfg = Config {
+            first_trigger: Trigger::Middle,
+            keyboard_hook: true,
+            target_vk_code: target,
+            ..Config::default()
+        };
         let engine = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
             ResendTags::next_unique(),
@@ -2579,10 +2613,12 @@ mod tests {
         use crate::exclusions::ExclusionList;
 
         let excluded_pt = Point { x: 100, y: 100 };
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::Middle;
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkPause;
+        let cfg = Config {
+            first_trigger: Trigger::Middle,
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkPause,
+            ..Config::default()
+        };
         let matcher = ExclusionList::from_lines(["C:\\Games\\game.exe"]).to_matcher();
         let mut kb = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()).with_exclusions(matcher),
@@ -2631,10 +2667,12 @@ mod tests {
 
     /// The mouse trigger on LR, the keyboard trigger on Left Alt
     fn lr_kb_engine() -> (TriggerEngine, MockHost, u32) {
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::Lr;
-        cfg.keyboard_hook = true;
-        cfg.target_vk_code = TriggerKey::VkLmenu;
+        let cfg = Config {
+            first_trigger: Trigger::Lr,
+            keyboard_hook: true,
+            target_vk_code: TriggerKey::VkLmenu,
+            ..Config::default()
+        };
         let engine = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()),
             ResendTags::next_unique(),
@@ -2825,8 +2863,10 @@ mod tests {
         // wait (Right's down resent before it), as for any passed press, not passed as the up of
         // the old resent down with Right still waiting
         let excluded_pt = Point { x: 100, y: 100 };
-        let mut cfg = Config::default();
-        cfg.first_trigger = Trigger::Lr;
+        let cfg = Config {
+            first_trigger: Trigger::Lr,
+            ..Config::default()
+        };
         let matcher = ExclusionList::from_lines(["C:\\Games\\game.exe"]).to_matcher();
         let mut engine = TriggerEngine::new(
             EngineConfig::from_config(&cfg, &CustomTableState::default()).with_exclusions(matcher),
@@ -2883,5 +2923,113 @@ mod tests {
         );
         assert!(host.take_calls().is_empty());
         assert_eq!(engine.up_owners.get(MouseButton::Right), UpOwner::None);
+    }
+
+    /// RightDrag, with draggedLock as given (thresholds 5)
+    fn drag_engine(dragged_lock: bool) -> (TriggerEngine, ResendTags, MockHost) {
+        let cfg = Config {
+            first_trigger: Trigger::RightDrag,
+            dragged_lock,
+            accel_table: false,
+            vertical_threshold: 5,
+            horizontal_threshold: 5,
+            vh_adjuster_mode: false,
+            ..Config::default()
+        };
+        let tags = ResendTags::next_unique();
+        let engine = TriggerEngine::new(EngineConfig::from_config(&cfg, &CustomTableState::default()), tags);
+        (engine, tags, MockHost::new())
+    }
+
+    fn has_click(host: &mut MockHost) -> bool {
+        host.take_calls().iter().any(|c| matches!(c, HostCall::Click(..)))
+    }
+
+    #[test]
+    fn drag_takes_a_scroll_or_a_real_move_as_dragged() {
+        let right = MouseButton::Right;
+
+        // Scrolled with no move seen by the hook: dragged, released (draggedLock)
+        let (mut engine, _tags, mut host) = drag_engine(true);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(right), 10, 10, 100), &mut host);
+        engine.on_raw_motion(0, 15, 120, &mut host);
+        assert!(host.take_calls().iter().any(|c| matches!(c, HostCall::Wheel(..))));
+        assert_eq!(engine.handle_mouse(phys_mouse(HookMouseKind::Up(right), 10, 10, 200), &mut host), HookDecision::Suppress);
+        assert!(engine.is_scrolling());
+        assert!(!has_click(&mut host));
+
+        // Dragged with draggedLock off: its up ends the scroll, with no click
+        let (mut engine, _tags, mut host) = drag_engine(false);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(right), 10, 10, 100), &mut host);
+        assert_eq!(engine.handle_mouse(phys_mouse(HookMouseKind::Move, 12, 10, 120), &mut host), HookDecision::Suppress);
+        assert_eq!(engine.handle_mouse(phys_mouse(HookMouseKind::Up(right), 12, 10, 200), &mut host), HookDecision::Suppress);
+        assert!(!engine.is_scrolling());
+        assert!(!has_click(&mut host));
+
+        // A move to the same point, an injected move, and a move older than the start are not a
+        // drag: the up ends the scroll and the click is resent
+        let (mut engine, _tags, mut host) = drag_engine(true);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(right), 10, 10, 1000), &mut host);
+        assert_eq!(engine.handle_mouse(phys_mouse(HookMouseKind::Move, 10, 10, 1010), &mut host), HookDecision::Suppress);
+        assert_eq!(
+            engine.handle_mouse(inj_mouse(HookMouseKind::Move, 30, 30, 1020, 0), &mut host),
+            HookDecision::Suppress
+        );
+        engine.on_raw_motion(0, 15, 900, &mut host);
+        assert!(!host.take_calls().iter().any(|c| matches!(c, HostCall::Wheel(..))));
+        assert_eq!(engine.handle_mouse(phys_mouse(HookMouseKind::Up(right), 10, 10, 1100), &mut host), HookDecision::Suppress);
+        assert!(!engine.is_scrolling());
+        assert!(has_click(&mut host));
+
+        // Released, the drag's moves are suppressed and the next down ends it
+        let (mut engine, _tags, mut host) = drag_engine(true);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(right), 10, 10, 100), &mut host);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Move, 12, 10, 120), &mut host);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Up(right), 12, 10, 200), &mut host);
+        assert!(engine.is_scrolling());
+        assert_eq!(engine.handle_mouse(phys_mouse(HookMouseKind::Move, 40, 40, 300), &mut host), HookDecision::Suppress);
+        assert_eq!(engine.handle_mouse(phys_mouse(HookMouseKind::Down(right), 40, 40, 400), &mut host), HookDecision::Suppress);
+        assert!(!engine.is_scrolling());
+        assert_eq!(engine.handle_mouse(phys_mouse(HookMouseKind::Up(right), 40, 40, 450), &mut host), HookDecision::Suppress);
+        assert!(!has_click(&mut host));
+    }
+
+    #[test]
+    fn lr_pair_ends_or_releases_at_its_second_up_by_the_locktime() {
+        let (left, right) = (MouseButton::Left, MouseButton::Right);
+
+        // The first up keeps the scroll; the second, later than the locktime after the start,
+        // ends it
+        let (mut engine, _tags, mut host) = base_engine(Trigger::Lr);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(left), 0, 0, 100), &mut host);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(right), 0, 0, 150), &mut host);
+        assert_eq!(engine.handle_mouse(phys_mouse(HookMouseKind::Up(left), 0, 0, 200), &mut host), HookDecision::Suppress);
+        assert!(engine.is_scrolling());
+        assert_eq!(engine.handle_mouse(phys_mouse(HookMouseKind::Up(right), 0, 0, 500), &mut host), HookDecision::Suppress);
+        assert!(!engine.is_scrolling());
+
+        // Within the locktime: released, the next down ends it
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(left), 0, 0, 1000), &mut host);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(right), 0, 0, 1050), &mut host);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Up(right), 0, 0, 1100), &mut host);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Up(left), 0, 0, 1200), &mut host);
+        assert!(engine.is_scrolling());
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Middle), 0, 0, 1500), &mut host),
+            HookDecision::Suppress
+        );
+        assert!(!engine.is_scrolling());
+
+        // A button other than the pair's up does not count as the pair's: the ups of the pair,
+        // later than the locktime, are the first (the scroll goes on) and the second (it ends)
+        engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Middle), 0, 0, 1550), &mut host);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(left), 0, 0, 2000), &mut host);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(right), 0, 0, 2050), &mut host);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::X1), 0, 0, 2060), &mut host);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::X1), 0, 0, 2070), &mut host);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Up(left), 0, 0, 2400), &mut host);
+        assert!(engine.is_scrolling());
+        engine.handle_mouse(phys_mouse(HookMouseKind::Up(right), 0, 0, 2450), &mut host);
+        assert!(!engine.is_scrolling());
     }
 }

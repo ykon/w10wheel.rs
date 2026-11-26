@@ -41,8 +41,7 @@ use crate::ui_win32::{
     set_user_data, set_window_icon, set_window_text, show_window, to_wide, user_data,
 };
 
-pub(crate) const ADMIN_RESTART_MESSAGE: u32 = 0x8005; // WM_APP + 5
-pub(crate) const TRAY_SYNC_MESSAGE: u32 = 0x8007; // WM_APP + 7
+pub(crate) use w10wheel::wm_app::{ADMIN_RESTART_MESSAGE, TRAY_SYNC_MESSAGE};
 pub(crate) const ADMIN_RESTART_STARTED: usize = 0;
 pub(crate) const ADMIN_RESTART_CANCELED: usize = 1;
 pub(crate) const ADMIN_RESTART_FAILED: usize = 2;
@@ -303,11 +302,33 @@ struct NumberBinding {
 pub(crate) struct AppShared {
     pub store: ConfigStore,
     pub control: EngineControl,
-    pub paused: bool,
     pub dark: bool,
     pub tray_host: Handle,
     pub restarting_admin: bool,
     pub admin_error: Arc<Mutex<Option<String>>>,
+}
+
+impl AppShared {
+    /// The properties loaded (Reload, switching, deleting or resetting them): the process
+    /// priority set, and the triggers given the settings (the keyboard hook installed again, a
+    /// scroll ended: EngineControl::load_config)
+    pub fn apply_load(&self) {
+        let _ = set_process_priority(self.store.config().process_priority);
+        self.load_engine_config();
+    }
+
+    /// As apply_load, the priority left as it is: for the properties added, a copy of the
+    /// selected ones
+    pub fn load_engine_config(&self) {
+        let _ = self.control.load_config(EngineConfig::from_store(&self.store));
+    }
+
+    /// A setting changed (or the exclusions): applied to the triggers at once (a scroll in
+    /// progress goes on: EngineControl::set_config), and stored
+    pub fn apply_change(&mut self) {
+        let _ = self.control.set_config(EngineConfig::from_store(&self.store));
+        let _ = self.store.store();
+    }
 }
 
 pub(crate) struct SettingsWindow {
@@ -596,9 +617,7 @@ impl SettingsWindow {
         {
             let mut s = self.shared.borrow_mut();
             if s.store.reload().is_ok() {
-                let _ = set_process_priority(s.store.config().process_priority);
-                let next_cfg = EngineConfig::from_store(&s.store);
-                let _ = s.control.load_config(next_cfg);
+                s.apply_load();
             }
         }
         self.state.retext_all();
@@ -2920,9 +2939,7 @@ impl SettingsState {
         let tray_host = {
             let mut s = self.shared.borrow_mut();
             edit(s.store.config_mut());
-            let next_cfg = EngineConfig::from_store(&s.store);
-            let _ = s.control.set_config(next_cfg);
-            let _ = s.store.store();
+            s.apply_change();
             s.tray_host
         };
         if retext {
@@ -3015,10 +3032,7 @@ impl SettingsState {
     }
 
     fn push_config_and_save(&self) {
-        let mut s = self.shared.borrow_mut();
-        let next_cfg = EngineConfig::from_store(&s.store);
-        let _ = s.control.set_config(next_cfg);
-        let _ = s.store.store();
+        self.shared.borrow_mut().apply_change();
     }
 
     /// Before leaving the selected properties (switching, restarting as administrator), after they
@@ -3086,9 +3100,7 @@ impl SettingsState {
             let mut s = self.shared.borrow_mut();
             let r = s.store.switch_profile(&target);
             if r.is_ok() {
-                let _ = set_process_priority(s.store.config().process_priority);
-                let next = EngineConfig::from_store(&s.store);
-                let _ = s.control.load_config(next);
+                s.apply_load();
             }
             r
         };
@@ -3122,8 +3134,7 @@ impl SettingsState {
             let mut s = self.shared.borrow_mut();
             let r = s.store.add_profile(&name);
             if r.is_ok() {
-                let next = EngineConfig::from_store(&s.store);
-                let _ = s.control.load_config(next);
+                s.load_engine_config();
             }
             r
         };
@@ -3171,9 +3182,7 @@ impl SettingsState {
             let mut s = self.shared.borrow_mut();
             let r = s.store.delete_profile(&selected);
             if r.is_ok() {
-                let _ = set_process_priority(s.store.config().process_priority);
-                let next = EngineConfig::from_store(&s.store);
-                let _ = s.control.load_config(next);
+                s.apply_load();
             }
             r
         };
@@ -3205,9 +3214,7 @@ impl SettingsState {
             let name = s.store.selected_profile().to_owned();
             let res = s.store.reload();
             if res.is_ok() {
-                let _ = set_process_priority(s.store.config().process_priority);
-                let next = EngineConfig::from_store(&s.store);
-                let _ = s.control.load_config(next);
+                s.apply_load();
             }
             (
                 res,
@@ -3258,9 +3265,7 @@ impl SettingsState {
         let tray_host = {
             let mut s = self.shared.borrow_mut();
             let res = s.store.reset_to_defaults();
-            let _ = set_process_priority(s.store.config().process_priority);
-            let next = EngineConfig::from_store(&s.store);
-            let _ = s.control.load_config(next);
+            s.apply_load();
             if let Err(err) = res {
                 let l = s.store.config().ui_language;
                 let d = s.dark;
@@ -3356,9 +3361,7 @@ impl SettingsState {
                 }
             }
             if added_any {
-                let next = EngineConfig::from_store(&s.store);
-                let _ = s.control.set_config(next);
-                let _ = s.store.store();
+                s.apply_change();
             }
         }
         self.refresh_all();
@@ -3394,9 +3397,7 @@ impl SettingsState {
                 }
             }
             if removed_any {
-                let next = EngineConfig::from_store(&s.store);
-                let _ = s.control.set_config(next);
-                let _ = s.store.store();
+                s.apply_change();
             }
         }
         self.refresh_all();

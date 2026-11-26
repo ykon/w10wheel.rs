@@ -17,6 +17,7 @@ use crate::exclusions::ExclusionMatcher;
 use crate::ipc;
 use crate::sender::{MouseButton, Point, SendPacket, SendSink};
 use crate::trigger::{HookDecision, HookKeyEvent, HookMouseEvent, HookMouseKind, KeyAction};
+use crate::wm_app::COMMAND_WAKE_MESSAGE;
 use crate::{EngineConfig, SCROLL_ACTIVITY_MESSAGE, ScrollAxis};
 
 type Handle = *mut c_void;
@@ -55,7 +56,6 @@ const WM_MOUSEHWHEEL: u32 = 0x020E;
 const XBUTTON1: u16 = 0x0001;
 const XBUTTON2: u16 = 0x0002;
 const POLL_WAIT_TIMER: usize = 1;
-const COMMAND_WAKE_MESSAGE: u32 = 0x8000; // WM_APP
 const MSGFLT_ADD: u32 = 1;
 const SW_SHOWNORMAL: i32 = 1;
 const TOKEN_QUERY: u32 = 0x0008;
@@ -354,6 +354,7 @@ impl InstanceLock {
                 .read(true)
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .share_mode(0)
                 .open(path)
             {

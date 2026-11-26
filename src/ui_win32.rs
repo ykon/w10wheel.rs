@@ -562,7 +562,7 @@ pub(crate) fn init_ui_process() {
         let user32 = to_wide("user32.dll");
         let h_user32 = GetModuleHandleW(user32.as_ptr());
         if !h_user32.is_null() {
-            let proc = GetProcAddress(h_user32, b"SetProcessDpiAwarenessContext\0".as_ptr());
+            let proc = GetProcAddress(h_user32, c"SetProcessDpiAwarenessContext".as_ptr().cast());
             if !proc.is_null() {
                 let set_dpi = std::mem::transmute::<*const c_void, SetProcessDpiAwarenessContextFn>(
                     proc,
@@ -589,7 +589,7 @@ pub(crate) fn dpi_for_window(hwnd: Handle) -> u32 {
         if h_user32.is_null() {
             return None;
         }
-        let proc = GetProcAddress(h_user32, b"GetDpiForWindow\0".as_ptr());
+        let proc = GetProcAddress(h_user32, c"GetDpiForWindow".as_ptr().cast());
         (!proc.is_null()).then(|| std::mem::transmute::<*const c_void, GetDpiForWindowFn>(proc))
     });
     if let Some(get_dpi) = f {
@@ -619,7 +619,7 @@ pub(crate) fn adjust_window_size(
         if h_user32.is_null() {
             return None;
         }
-        let proc = GetProcAddress(h_user32, b"AdjustWindowRectExForDpi\0".as_ptr());
+        let proc = GetProcAddress(h_user32, c"AdjustWindowRectExForDpi".as_ptr().cast());
         (!proc.is_null())
             .then(|| std::mem::transmute::<*const c_void, AdjustWindowRectExForDpiFn>(proc))
     });

@@ -11,6 +11,7 @@ use w10wheel::cli::{CliAction, IpcCommand, LaunchOptions, parse_args};
 use w10wheel::config::UiLanguage;
 use w10wheel::locale::{format_tray_tooltip, tr};
 use w10wheel::properties::{ConfigStore, DEFAULT_PROFILE};
+use w10wheel::wm_app::TRAY_CALLBACK_MESSAGE;
 use w10wheel::{
     AdminStartResult, EngineConfig, EngineControl, IPC_COMMAND_MESSAGE, InputEngine,
     KEYBOARD_HOOK_FAILED_MESSAGE, KEYBOARD_HOOK_FAILED_ON_LOAD,
@@ -63,7 +64,6 @@ const DEVICE_NOTIFY_WINDOW_HANDLE: u32 = 0;
 const TRAY_CLASS: &str = "W10WheelTrayHost";
 const ICON_ID: u32 = 1;
 const NOTIFYICON_VERSION_4: u32 = 4;
-const WM_TRAY_CALLBACK: u32 = 0x8001; // WM_APP + 1
 
 const WM_LBUTTONDBLCLK: u16 = 0x0203;
 const WM_CONTEXTMENU: u16 = 0x007B;
@@ -296,7 +296,6 @@ fn run(options: LaunchOptions) -> ExitCode {
     let shared = Rc::new(RefCell::new(AppShared {
         store,
         control: engine.control(),
-        paused: false,
         dark,
         tray_host: null_mut(),
         restarting_admin: false,
@@ -425,7 +424,7 @@ unsafe extern "system" fn tray_wnd_proc(
     let state = unsafe { &mut *ptr };
 
     match msg {
-        m if m == WM_TRAY_CALLBACK => {
+        TRAY_CALLBACK_MESSAGE => {
             handle_tray_callback(hwnd, state, lparam);
             return 0;
         }
@@ -680,7 +679,6 @@ fn handle_keyboard_hook_failed(state: &mut TrayHostState, wparam: usize, lparam:
 fn set_paused(hwnd: Handle, state: &mut TrayHostState, paused: bool) {
     let _ = state.control.set_paused(paused);
     state.paused = paused;
-    state.shared.borrow_mut().paused = paused;
     let hw = unsafe { w::HWND::from_ptr(hwnd) };
     state.cursor.set_axis(&hw, None);
     let _ = sync_tray(hwnd, state);
@@ -816,7 +814,7 @@ fn sync_tray(hwnd: Handle, state: &mut TrayHostState) -> w::AnyResult<()> {
     let hw = unsafe { w::HWND::from_ptr(hwnd) };
     let mut data = tray_data(&hw);
     data.uFlags = co::NIF::MESSAGE | co::NIF::ICON | co::NIF::TIP | co::NIF::SHOWTIP;
-    data.uCallbackMessage = unsafe { co::WM::from_raw(WM_TRAY_CALLBACK) };
+    data.uCallbackMessage = unsafe { co::WM::from_raw(TRAY_CALLBACK_MESSAGE) };
     data.uVersion = NOTIFYICON_VERSION_4;
     data.hIcon = unsafe {
         w::HICON::from_ptr(

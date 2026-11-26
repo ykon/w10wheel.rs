@@ -62,7 +62,7 @@ pub(crate) fn system_icon_size(dpi: u32, small: bool) -> i32 {
         if module.is_null() {
             return None;
         }
-        let proc = GetProcAddress(module, b"GetSystemMetricsForDpi\0".as_ptr());
+        let proc = GetProcAddress(module, c"GetSystemMetricsForDpi".as_ptr().cast());
         (!proc.is_null())
             .then(|| std::mem::transmute::<*const c_void, GetSystemMetricsForDpiFn>(proc))
     });

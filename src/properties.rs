@@ -1280,7 +1280,8 @@ fn changed_keys(
 ) -> Vec<String> {
     current
         .iter()
-        .filter_map(|(k, v)| (stored.get(k) != Some(v)).then(|| k.clone()))
+        .filter(|&(k, v)| stored.get(k) != Some(v))
+        .map(|(k, _)| k.clone())
         .collect()
 }
 
