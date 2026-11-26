@@ -755,6 +755,39 @@ pub struct StartupLoadReport {
     pub missing_profile: Option<String>,
 }
 
+/// What is known of a file of the selected properties (the properties, or the excluded programs)
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct FileState {
+    /// Read at the load: its changes are stored. Not read (an error, or no settings folder): they
+    /// are not, so that a file that could not be read is not overwritten.
+    loaded: bool,
+    /// Why it could not be read: at the load, or at a Reload that failed after it
+    load_error: Option<String>,
+    /// Why the last store failed
+    store_error: Option<String>,
+}
+
+impl FileState {
+    fn loaded() -> Self {
+        Self {
+            loaded: true,
+            ..Self::default()
+        }
+    }
+
+    fn unreadable(error: impl Into<String>) -> Self {
+        Self {
+            load_error: Some(error.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Why its changes are not stored: the error of the store, else of the load
+    fn reason(&self) -> Option<&str> {
+        self.store_error.as_deref().or(self.load_error.as_deref())
+    }
+}
+
 /// Manages active settings, profile switching, partial persistence, and read/write error states.
 pub struct ConfigStore {
     dir: Option<PathBuf>,
@@ -764,14 +797,14 @@ pub struct ConfigStore {
     exclusions: ExclusionList,
     stored_exclusions: ExclusionList,
     system_lang: UiLanguage,
-    loaded: bool,
-    exclusions_loaded: bool,
+    /// The properties file
+    properties_file: FileState,
+    /// The excluded programs' file
+    exclusions_file: FileState,
+    /// The excluded programs are written at the next store even if unchanged (reset_to_defaults:
+    /// a file made meanwhile outside W10Wheel is replaced)
     exclusions_rewrite: bool,
     stored_map: BTreeMap<String, String>,
-    load_error: Option<String>,
-    store_error: Option<String>,
-    exclusions_load_error: Option<String>,
-    exclusions_store_error: Option<String>,
 }
 
 impl ConfigStore {
@@ -791,14 +824,10 @@ impl ConfigStore {
             exclusions: ExclusionList::new(),
             stored_exclusions: ExclusionList::new(),
             system_lang,
-            loaded: false,
-            exclusions_loaded: false,
+            properties_file: FileState::default(),
+            exclusions_file: FileState::default(),
             exclusions_rewrite: false,
             stored_map,
-            load_error: None,
-            store_error: None,
-            exclusions_load_error: None,
-            exclusions_store_error: None,
         }
     }
 
@@ -813,14 +842,10 @@ impl ConfigStore {
             exclusions: ExclusionList::new(),
             stored_exclusions: ExclusionList::new(),
             system_lang,
-            loaded: false,
-            exclusions_loaded: false,
+            properties_file: FileState::unreadable(error),
+            exclusions_file: FileState::default(),
             exclusions_rewrite: false,
             stored_map,
-            load_error: Some(error.into()),
-            store_error: None,
-            exclusions_load_error: None,
-            exclusions_store_error: None,
         }
     }
 
@@ -865,27 +890,27 @@ impl ConfigStore {
     }
 
     pub fn is_loaded(&self) -> bool {
-        self.loaded
+        self.properties_file.loaded
     }
 
     pub fn exclusions_loaded(&self) -> bool {
-        self.exclusions_loaded
+        self.exclusions_file.loaded
     }
 
     pub fn load_error(&self) -> Option<&str> {
-        self.load_error.as_deref()
+        self.properties_file.load_error.as_deref()
     }
 
     pub fn store_error(&self) -> Option<&str> {
-        self.store_error.as_deref()
+        self.properties_file.store_error.as_deref()
     }
 
     pub fn exclusions_load_error(&self) -> Option<&str> {
-        self.exclusions_load_error.as_deref()
+        self.exclusions_file.load_error.as_deref()
     }
 
     pub fn exclusions_store_error(&self) -> Option<&str> {
-        self.exclusions_store_error.as_deref()
+        self.exclusions_file.store_error.as_deref()
     }
 
     /// Why the changes left unsaved could not be saved (has_unsaved_changes), as .NET tells it when
@@ -894,11 +919,8 @@ impl ConfigStore {
     pub fn unsaved_reason(&self) -> Option<&str> {
         let settings_unsaved =
             !changed_keys(&self.config.to_property_map(), &self.stored_map).is_empty();
-        let of_settings = self.store_error.as_deref().or(self.load_error.as_deref());
-        let of_exclusions = self
-            .exclusions_store_error
-            .as_deref()
-            .or(self.exclusions_load_error.as_deref());
+        let of_settings = self.properties_file.reason();
+        let of_exclusions = self.exclusions_file.reason();
         if settings_unsaved {
             of_settings.or(of_exclusions)
         } else {
@@ -912,15 +934,16 @@ impl ConfigStore {
     }
 
     pub fn store_status(&self) -> Option<StoreStatus> {
-        if !self.loaded {
+        let (properties, exclusions) = (&self.properties_file, &self.exclusions_file);
+        if !properties.loaded {
             Some(StoreStatus::PropertiesUnreadableNotSaved)
-        } else if self.store_error.is_some() {
+        } else if properties.store_error.is_some() {
             Some(StoreStatus::PropertiesSaveFailed)
-        } else if !self.exclusions_loaded {
+        } else if !exclusions.loaded {
             Some(StoreStatus::ExclusionsUnreadableNotSaved)
-        } else if self.exclusions_store_error.is_some() {
+        } else if exclusions.store_error.is_some() {
             Some(StoreStatus::ExclusionsSaveFailed)
-        } else if self.load_error.is_some() {
+        } else if properties.load_error.is_some() {
             Some(StoreStatus::PropertiesReadFailed)
         } else {
             None
@@ -952,44 +975,16 @@ impl ConfigStore {
 
         self.selected = target.clone();
         match read_profile_map(&dir, &target, self.lang()) {
-            Ok(map) => {
-                let (config, custom_table) = Config::from_property_map(&map, self.system_lang);
-                self.stored_map = config.to_property_map();
-                self.config = config;
-                self.custom_table = custom_table;
-                self.loaded = true;
-                self.load_error = None;
-                self.store_error = None;
-            }
+            Ok(map) => self.apply_properties(&map),
             Err(err) => {
                 let config = Config::default_for_language(self.system_lang);
                 self.stored_map = config.to_property_map();
                 self.config = config;
                 self.custom_table = CustomTableState::NotWritten;
-                self.loaded = false;
-                self.load_error = Some(err.to_string());
-                self.store_error = None;
+                self.properties_file = FileState::unreadable(err.to_string());
             }
         }
-
-        match ExclusionsFile::read(&exclusions_path(&dir, &target)) {
-            Ok(list) => {
-                self.exclusions = list.clone();
-                self.stored_exclusions = list;
-                self.exclusions_loaded = true;
-                self.exclusions_rewrite = false;
-                self.exclusions_load_error = None;
-                self.exclusions_store_error = None;
-            }
-            Err(err) => {
-                self.exclusions = ExclusionList::new();
-                self.stored_exclusions = ExclusionList::new();
-                self.exclusions_loaded = false;
-                self.exclusions_rewrite = false;
-                self.exclusions_load_error = Some(err.to_string());
-                self.exclusions_store_error = None;
-            }
-        }
+        self.apply_exclusions(ExclusionsFile::read(&exclusions_path(&dir, &target)), false);
         report
     }
 
@@ -998,12 +993,12 @@ impl ConfigStore {
             return Ok(());
         };
 
-        let prop_result = if self.loaded {
+        let prop_result = if self.properties_file.loaded {
             self.store_properties(&dir)
         } else {
             Ok(())
         };
-        let excl_result = if self.exclusions_loaded {
+        let excl_result = if self.exclusions_file.loaded {
             self.store_exclusions(&dir)
         } else {
             Ok(())
@@ -1034,11 +1029,11 @@ impl ConfigStore {
         match result {
             Ok(()) => {
                 self.stored_map = current;
-                self.store_error = None;
+                self.properties_file.store_error = None;
                 Ok(())
             }
             Err(err) => {
-                self.store_error = Some(err.to_string());
+                self.properties_file.store_error = Some(err.to_string());
                 Err(err)
             }
         }
@@ -1046,12 +1041,12 @@ impl ConfigStore {
 
     fn store_exclusions(&mut self, dir: &Path) -> io::Result<()> {
         if !self.exclusions_rewrite && self.exclusions == self.stored_exclusions {
-            self.exclusions_store_error = None;
+            self.exclusions_file.store_error = None;
             return Ok(());
         }
         if !profile_path(dir, &self.selected).exists() && self.selected != DEFAULT_PROFILE {
             let err = not_found_error(self.lang(), &self.selected);
-            self.exclusions_store_error = Some(err.to_string());
+            self.exclusions_file.store_error = Some(err.to_string());
             return Err(err);
         }
 
@@ -1060,11 +1055,11 @@ impl ConfigStore {
             Ok(()) => {
                 self.stored_exclusions = self.exclusions.clone();
                 self.exclusions_rewrite = false;
-                self.exclusions_store_error = None;
+                self.exclusions_file.store_error = None;
                 Ok(())
             }
             Err(err) => {
-                self.exclusions_store_error = Some(err.to_string());
+                self.exclusions_file.store_error = Some(err.to_string());
                 Err(err)
             }
         }
@@ -1078,7 +1073,8 @@ impl ConfigStore {
         let map = match read_profile_map(&dir, &name, self.lang()) {
             Ok(map) => map,
             Err(err) => {
-                self.load_error = Some(err.to_string());
+                // The properties running are kept, and their changes still stored
+                self.properties_file.load_error = Some(err.to_string());
                 return Err(err);
             }
         };
@@ -1217,33 +1213,41 @@ impl ConfigStore {
         map: &BTreeMap<String, String>,
         exclusions: io::Result<ExclusionList>,
     ) {
-        let (config, custom_table) = Config::from_property_map(map, self.system_lang);
         let same_profile = self.selected == name;
         self.selected = name;
+        self.apply_properties(map);
+        self.apply_exclusions(exclusions, same_profile);
+    }
+
+    /// The properties as read (`map`): running, and stored from now
+    fn apply_properties(&mut self, map: &BTreeMap<String, String>) {
+        let (config, custom_table) = Config::from_property_map(map, self.system_lang);
         self.stored_map = config.to_property_map();
         self.config = config;
         self.custom_table = custom_table;
-        self.loaded = true;
-        self.load_error = None;
-        self.store_error = None;
+        self.properties_file = FileState::loaded();
+    }
+
+    /// The excluded programs as read, or none if they could not be: not stored then. With
+    /// `keep_running` (a Reload of the same properties), the list running is kept instead, with
+    /// its changes and the error of its last store.
+    fn apply_exclusions(&mut self, exclusions: io::Result<ExclusionList>, keep_running: bool) {
         match exclusions {
             Ok(list) => {
                 self.exclusions = list.clone();
                 self.stored_exclusions = list;
-                self.exclusions_loaded = true;
                 self.exclusions_rewrite = false;
-                self.exclusions_load_error = None;
-                self.exclusions_store_error = None;
+                self.exclusions_file = FileState::loaded();
+            }
+            Err(err) if keep_running => {
+                self.exclusions_file.loaded = false;
+                self.exclusions_file.load_error = Some(err.to_string());
             }
             Err(err) => {
-                self.exclusions_loaded = false;
-                self.exclusions_load_error = Some(err.to_string());
-                if !same_profile {
-                    self.exclusions = ExclusionList::new();
-                    self.stored_exclusions = ExclusionList::new();
-                    self.exclusions_rewrite = false;
-                    self.exclusions_store_error = None;
-                }
+                self.exclusions = ExclusionList::new();
+                self.stored_exclusions = ExclusionList::new();
+                self.exclusions_rewrite = false;
+                self.exclusions_file = FileState::unreadable(err.to_string());
             }
         }
     }
@@ -2094,6 +2098,125 @@ mod tests {
             PropertiesFile::read_map(&path)?.get(keys::KEYBOARD_HOOK).map(String::as_str),
             Some("false")
         );
+        Ok(())
+    }
+
+    fn lock(path: &Path) -> io::Result<fs::File> {
+        OpenOptions::new().read(true).share_mode(0).open(path)
+    }
+
+    #[test]
+    fn no_settings_folder_stores_nothing_and_says_so() -> io::Result<()> {
+        let mut store = ConfigStore::session_only(UiLanguage::En, "no folder");
+        assert!(!store.is_loaded());
+        assert_eq!(store.load_error(), Some("no folder"));
+        assert_eq!(store.store_status(), Some(StoreStatus::PropertiesUnreadableNotSaved));
+        store.config_mut().reverse_scroll = true;
+        store.store()?;
+        assert_eq!(store.unsaved_reason(), Some("no folder"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_reload_that_fails_keeps_the_properties_stored_and_says_why() -> io::Result<()> {
+        let dir = TestDir::new()?;
+        let mut store = ConfigStore::open_in(dir.0.clone(), UiLanguage::En);
+        store.load_startup(None);
+        store.store()?;
+        let path = profile_path(&dir.0, DEFAULT_PROFILE);
+
+        // The file locked: the Reload fails, the properties running are kept and still stored
+        let held = lock(&path)?;
+        assert!(store.reload().is_err());
+        assert!(store.is_loaded());
+        let load_error = store.load_error().map(str::to_owned);
+        assert!(load_error.is_some());
+        assert_eq!(store.store_status(), Some(StoreStatus::PropertiesReadFailed));
+        store.config_mut().reverse_scroll = true;
+        assert_eq!(store.unsaved_reason(), load_error.as_deref());
+
+        // Stored while still locked: the error of the store first
+        assert!(store.store().is_err());
+        assert_eq!(store.store_status(), Some(StoreStatus::PropertiesSaveFailed));
+        assert_eq!(store.unsaved_reason(), store.store_error());
+        drop(held);
+
+        // Stored again: the store error goes, the load error stays until a load succeeds
+        store.store()?;
+        assert_eq!(store.store_error(), None);
+        assert_eq!(store.store_status(), Some(StoreStatus::PropertiesReadFailed));
+        store.reload()?;
+        assert_eq!(store.store_status(), None);
+        assert!(store.config().reverse_scroll);
+        Ok(())
+    }
+
+    #[test]
+    fn the_exclusions_keep_their_store_error_through_a_reload_that_cannot_read_them() -> io::Result<()> {
+        let dir = TestDir::new()?;
+        let mut store = ConfigStore::open_in(dir.0.clone(), UiLanguage::En);
+        store.load_startup(None);
+        assert!(store.exclusions_mut().add("C:\\Apps\\a.exe"));
+        store.store()?;
+        let excl = exclusions_path(&dir.0, DEFAULT_PROFILE);
+
+        // Changed and stored while the file is locked: the store fails
+        let held = lock(&excl)?;
+        assert!(store.exclusions_mut().add("C:\\Apps\\b.exe"));
+        assert!(store.store().is_err());
+        assert_eq!(store.store_status(), Some(StoreStatus::ExclusionsSaveFailed));
+        let store_error = store.exclusions_store_error().map(str::to_owned);
+        assert!(store_error.is_some());
+
+        // Reloaded while still locked: the list running is kept, not stored, and the reason of
+        // the changes left is still the store error (the settings have none)
+        store.reload()?;
+        assert!(!store.exclusions_loaded());
+        assert!(store.exclusions_load_error().is_some());
+        assert_eq!(store.exclusions_store_error(), store_error.as_deref());
+        assert_eq!(store.exclusions().len(), 2);
+        assert_eq!(store.store_status(), Some(StoreStatus::ExclusionsUnreadableNotSaved));
+        assert!(store.has_unsaved_changes());
+        assert_eq!(store.unsaved_reason(), store_error.as_deref());
+        store.store()?;
+        drop(held);
+        assert!(!fs::read_to_string(&excl)?.contains("b.exe"));
+
+        // Read again: all is as in the file, and nothing is left
+        store.reload()?;
+        assert!(store.exclusions_loaded());
+        assert_eq!(store.exclusions().len(), 1);
+        assert_eq!(store.exclusions_store_error(), None);
+        assert_eq!(store.store_status(), None);
+        assert_eq!(store.unsaved_reason(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn the_reason_of_unsaved_changes_is_of_the_file_changed_first() -> io::Result<()> {
+        let dir = TestDir::new()?;
+        let mut store = ConfigStore::open_in(dir.0.clone(), UiLanguage::En);
+        store.load_startup(None);
+        assert!(store.exclusions_mut().add("C:\\Apps\\a.exe"));
+        store.store()?;
+        let prop = profile_path(&dir.0, DEFAULT_PROFILE);
+        let excl = exclusions_path(&dir.0, DEFAULT_PROFILE);
+
+        // Both fail to be stored
+        let held = (lock(&prop)?, lock(&excl)?);
+        store.config_mut().reverse_scroll = !store.config().reverse_scroll;
+        assert!(store.exclusions_mut().add("C:\\Apps\\b.exe"));
+        assert!(store.store().is_err());
+        let of_settings = store.store_error().map(str::to_owned);
+        let of_exclusions = store.exclusions_store_error().map(str::to_owned);
+        assert!(of_settings.is_some() && of_exclusions.is_some());
+        // The settings are checked first in the status, and in the reason while they are changed
+        assert_eq!(store.store_status(), Some(StoreStatus::PropertiesSaveFailed));
+        assert_eq!(store.unsaved_reason(), of_settings.as_deref());
+        // The settings as stored again: the reason is of the excluded programs
+        store.config_mut().reverse_scroll = !store.config().reverse_scroll;
+        assert_eq!(store.unsaved_reason(), of_exclusions.as_deref());
+        drop(held);
         Ok(())
     }
 }
