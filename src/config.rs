@@ -323,10 +323,6 @@ impl TriggerKey {
             Self::VkRmenu => 0xA5,
         }
     }
-
-    pub fn is_no_repeat(self) -> bool {
-        matches!(self, Self::VkPause)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -830,8 +826,6 @@ mod tests {
         assert_eq!(ProcessPriority::parse("Low"), Option::None);
 
         assert_eq!(TriggerKey::VkNonconvert.vk_code(), 0x1D);
-        assert!(TriggerKey::VkPause.is_no_repeat());
-        assert!(!TriggerKey::VkTab.is_no_repeat());
         assert_eq!(TriggerKey::parse("None"), Some(TriggerKey::None));
         assert_eq!(TriggerKey::parse("VK_RMENU"), Some(TriggerKey::VkRmenu));
 
