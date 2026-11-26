@@ -950,12 +950,6 @@ impl ConfigStore {
         }
     }
 
-    pub fn status_message(&self) -> Option<&'static str> {
-        self.store_status().map(|status| {
-            crate::locale::tr(UiLanguage::Ja, crate::locale::store_status_key(status))
-        })
-    }
-
     pub fn load_startup(&mut self, requested_profile: Option<&str>) -> StartupLoadReport {
         let mut report = StartupLoadReport::default();
         let Some(dir) = self.dir.clone() else {
