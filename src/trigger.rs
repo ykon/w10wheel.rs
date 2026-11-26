@@ -5,7 +5,6 @@ use crate::scroll::{ScrollAxis, ScrollConfig, ScrollSession, WheelEvent};
 use crate::sender::{KIND_DOWN, KIND_PLAIN, KIND_RELEASE, MouseButton, PRESS_ID_MASK, Point, ResendTags, ResentInfo};
 
 const KEY_COUNT: usize = 256;
-const VK_PAUSE: u32 = 0x13;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TriggerConfig {
@@ -827,22 +826,8 @@ impl TriggerEngine {
 
         match event.action {
             KeyAction::Down => {
-                // Pause does not repeat: its down is always a new press. Down again while its
-                // first down is suppressed, it ends the scroll (it toggles it).
-                if event.vk_code == VK_PAUSE && is_trigger_key {
-                    match self.keys.get(vk) {
-                        KeyState::Suppressed => {
-                            self.keys.set(vk, KeyState::Idle);
-                            if self.is_released_scroll() || self.is_pressed_keyboard_scroll() {
-                                self.exit_scroll(host);
-                            }
-                            return false;
-                        }
-                        KeyState::Passed => self.keys.set(vk, KeyState::Idle),
-                        KeyState::Idle | KeyState::LoneUp => {}
-                    }
-                }
-
+                // Pause is a key as the others: held, it repeats too (a USB keyboard), and its up
+                // comes (with its down at once, a PS/2 one)
                 match self.keys.get(vk) {
                     KeyState::Suppressed => return false,
                     KeyState::Passed => return true,
@@ -858,8 +843,7 @@ impl TriggerEngine {
                 // handled before the posted messages, and the reset forgot it. It passes as that
                 // press did, its up too: taken as a new press, it would start a scroll (or end
                 // one) and be suppressed, its up too, the key left pressed in the application.
-                // Not Pause, which does not repeat: its down is always a new press.
-                if event.vk_code != VK_PAUSE && host.is_key_down(event.vk_code) {
+                if host.is_key_down(event.vk_code) {
                     self.keys.set(vk, KeyState::Passed);
                     return true;
                 }
@@ -871,9 +855,7 @@ impl TriggerEngine {
                         return false;
                     }
                     if host.is_excluded(host.cursor_pos(), &self.config.exclusions) {
-                        if event.vk_code != VK_PAUSE {
-                            self.keys.set(vk, KeyState::Passed);
-                        }
+                        self.keys.set(vk, KeyState::Passed);
                         return true;
                     }
                     let scroll = ActiveScroll::new_immediate(
@@ -884,9 +866,7 @@ impl TriggerEngine {
                     if !self.start_scroll(scroll, host) {
                         // Scroll mode could not start: the key passes as if it were not the
                         // trigger (its repeats and its up too)
-                        if event.vk_code != VK_PAUSE {
-                            self.keys.set(vk, KeyState::Passed);
-                        }
+                        self.keys.set(vk, KeyState::Passed);
                         return true;
                     }
                     self.keys.set(vk, KeyState::Suppressed);
@@ -1062,11 +1042,10 @@ impl TriggerEngine {
     /// The trigger key, if it is down now, is taken as passed: its down reached the application
     /// with no hook to see it, so its repeats and its up pass, and its next press is the trigger.
     /// GetAsyncKeyState tells only what it can (0 also when it cannot): a key taken as up is a
-    /// new press. Not the key that does not repeat (Pause): its down is always a new press.
+    /// new press.
     fn pass_held_trigger_key(&mut self, host: &mut impl TriggerHost) {
         let trigger = self.config.trigger.target_vk_code.vk_code();
         if self.config.trigger.keyboard_enabled()
-            && trigger != VK_PAUSE
             && let Ok(vk) = usize::try_from(trigger)
             && vk < KEY_COUNT
             && host.is_key_down(trigger)
@@ -1205,6 +1184,8 @@ impl TriggerEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const VK_PAUSE: u32 = 0x13;
 
     #[derive(Debug, PartialEq)]
     enum HostCall {
@@ -1587,30 +1568,14 @@ mod tests {
         );
         let mut host = MockHost::new();
 
-        // VK_PAUSE Down starts keyboard scroll; second VK_PAUSE Down exits even without KeyUp.
-        assert_eq!(
-            engine.handle_key(
-                HookKeyEvent {
-                    vk_code: VK_PAUSE,
-                    action: KeyAction::Down,
-                    time: 100
-                },
-                &mut host
-            ),
-            HookDecision::Suppress
-        );
+        // A press of VK_PAUSE (its down and up at once, as a PS/2 keyboard sends them) starts a
+        // released keyboard scroll; the next press ends it.
+        assert_eq!(engine.handle_key(key(VK_PAUSE, KeyAction::Down, 100), &mut host), HookDecision::Suppress);
+        assert_eq!(engine.handle_key(key(VK_PAUSE, KeyAction::Up, 100), &mut host), HookDecision::Suppress);
         assert!(engine.is_scrolling());
-        assert_eq!(
-            engine.handle_key(
-                HookKeyEvent {
-                    vk_code: VK_PAUSE,
-                    action: KeyAction::Down,
-                    time: 400
-                },
-                &mut host
-            ),
-            HookDecision::Suppress
-        );
+        assert_eq!(engine.handle_key(key(VK_PAUSE, KeyAction::Down, 400), &mut host), HookDecision::Suppress);
+        assert!(!engine.is_scrolling());
+        assert_eq!(engine.handle_key(key(VK_PAUSE, KeyAction::Up, 400), &mut host), HookDecision::Suppress);
         assert!(!engine.is_scrolling());
 
         // Start mouse Middle scroll, then press trigger key to cancel mouse scroll cleanly.
@@ -1741,7 +1706,7 @@ mod tests {
         );
         assert!(host.take_calls().is_empty());
 
-        // 4. Keyboard trigger (including VK_PAUSE without KeyUp) passes when cursor is over excluded window,
+        // 4. Keyboard trigger (VK_PAUSE) passes when cursor is over excluded window, its up too,
         //    then works normally when cursor moves back to a non-excluded window.
         cfg.first_trigger = Trigger::None;
         cfg.keyboard_hook = true;
@@ -1763,6 +1728,7 @@ mod tests {
             HookDecision::Pass
         );
         assert!(!kb_engine.is_scrolling());
+        assert_eq!(kb_engine.handle_key(key(VK_PAUSE, KeyAction::Up, 250), &mut host), HookDecision::Pass);
 
         host.cursor = normal_pt;
         assert_eq!(
@@ -2498,7 +2464,7 @@ mod tests {
     }
 
     #[test]
-    fn pause_key_down_is_always_a_new_press() {
+    fn pause_key_repeats_as_the_other_keys() {
         use crate::exclusions::ExclusionList;
 
         let excluded_pt = Point { x: 100, y: 100 };
@@ -2514,32 +2480,41 @@ mod tests {
         let mut host = MockHost::new();
         host.excluded_points.push(excluded_pt);
 
-        // Passed over an excluded window, but not kept as passed: the next down is the trigger,
-        // also told down in the system (Pause does not repeat)
-        host.cursor = excluded_pt;
-        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Down, 10), &mut host), HookDecision::Pass);
-        host.cursor = Point { x: 20, y: 20 };
-        host.keys_down.push(VK_PAUSE);
-        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Down, 50), &mut host), HookDecision::Suppress);
-        assert!(kb.is_scrolling());
-        host.keys_down.clear();
-
-        // Released within the locktime: the next down ends the released scroll, suppressed with
-        // its up
-        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Up, 100), &mut host), HookDecision::Suppress);
-        assert!(kb.is_scrolling());
-        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Down, 400), &mut host), HookDecision::Suppress);
+        // Held (a USB keyboard repeats it): its repeats are suppressed and the scroll goes on
+        // (not ended and started again at each repeat, the cursor flickering); its up ends it
+        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Down, 100), &mut host), HookDecision::Suppress);
+        for time in [600, 633, 666, 700] {
+            assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Down, time), &mut host), HookDecision::Suppress);
+            assert!(kb.is_scrolling());
+        }
+        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Up, 1000), &mut host), HookDecision::Suppress);
         assert!(!kb.is_scrolling());
-        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Up, 450), &mut host), HookDecision::Suppress);
 
-        // Passed while it was not the trigger, then made the trigger while still down: its next
-        // down is a new press, the trigger
-        let mut lmenu = cfg.clone();
-        lmenu.target_vk_code = TriggerKey::VkLmenu;
-        kb.set_config(EngineConfig::from_config(&lmenu, &CustomTableState::default()), &mut host);
-        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Down, 500), &mut host), HookDecision::Pass);
-        kb.set_config(EngineConfig::from_config(&cfg, &CustomTableState::default()), &mut host);
-        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Down, 600), &mut host), HookDecision::Suppress);
+        // Its down and up at once (a PS/2 keyboard): a released scroll, the next press ends it
+        kb.handle_key(key(VK_PAUSE, KeyAction::Down, 1100), &mut host);
+        kb.handle_key(key(VK_PAUSE, KeyAction::Up, 1100), &mut host);
+        assert!(kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Down, 1500), &mut host), HookDecision::Suppress);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Up, 1500), &mut host), HookDecision::Suppress);
+
+        // Passed over an excluded window: its repeats pass after moving out, no scroll starts
+        host.cursor = excluded_pt;
+        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Down, 2000), &mut host), HookDecision::Pass);
+        host.cursor = Point { x: 20, y: 20 };
+        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Down, 2500), &mut host), HookDecision::Pass);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Up, 2600), &mut host), HookDecision::Pass);
+
+        // Held when the keyboard hook is installed: its repeats and its up pass
+        host.keys_down.push(VK_PAUSE);
+        kb.on_keyboard_hook_removed(&mut host);
+        kb.on_keyboard_hook_installed(&mut host);
+        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Down, 3000), &mut host), HookDecision::Pass);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Up, 3100), &mut host), HookDecision::Pass);
+        host.keys_down.clear();
+        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Down, 3200), &mut host), HookDecision::Suppress);
         assert!(kb.is_scrolling());
     }
 }
