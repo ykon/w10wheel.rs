@@ -17,7 +17,8 @@ const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 /// What a resent button event is, told in its dwExtraInfo (ResendTags)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResendKind {
-    /// Nothing to tell of it (e.g. the up of another button sent after the waiting down)
+    /// Nothing to tell of it: the click of the waiting button released at another point than its
+    /// down (send_diff_point_click)
     Plain = 0,
     /// A down resent alone (the LR wait ended with no pair)
     Down = 1,
