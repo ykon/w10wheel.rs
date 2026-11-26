@@ -424,7 +424,7 @@ unsafe extern "system" fn tray_wnd_proc(
     let state = unsafe { &mut *ptr };
 
     match msg {
-        m if m == TRAY_CALLBACK_MESSAGE => {
+        TRAY_CALLBACK_MESSAGE => {
             handle_tray_callback(hwnd, state, lparam);
             return 0;
         }

@@ -2986,15 +2986,16 @@ mod tests {
         );
         assert!(!engine.is_scrolling());
 
-        // A button other than the pair's up does not count as the pair's
+        // A button other than the pair's up does not count as the pair's: the ups of the pair,
+        // later than the locktime, are the first (the scroll goes on) and the second (it ends)
         engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Middle), 0, 0, 1550), &mut host);
         engine.handle_mouse(phys_mouse(HookMouseKind::Down(left), 0, 0, 2000), &mut host);
         engine.handle_mouse(phys_mouse(HookMouseKind::Down(right), 0, 0, 2050), &mut host);
         engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::X1), 0, 0, 2060), &mut host);
         engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::X1), 0, 0, 2070), &mut host);
-        engine.handle_mouse(phys_mouse(HookMouseKind::Up(left), 0, 0, 2100), &mut host);
+        engine.handle_mouse(phys_mouse(HookMouseKind::Up(left), 0, 0, 2400), &mut host);
         assert!(engine.is_scrolling());
-        engine.handle_mouse(phys_mouse(HookMouseKind::Up(right), 0, 0, 2150), &mut host);
-        assert!(engine.is_scrolling());
+        engine.handle_mouse(phys_mouse(HookMouseKind::Up(right), 0, 0, 2450), &mut host);
+        assert!(!engine.is_scrolling());
     }
 }

@@ -322,6 +322,13 @@ impl AppShared {
     pub fn load_engine_config(&self) {
         let _ = self.control.load_config(EngineConfig::from_store(&self.store));
     }
+
+    /// A setting changed (or the exclusions): applied to the triggers at once (a scroll in
+    /// progress goes on: EngineControl::set_config), and stored
+    pub fn apply_change(&mut self) {
+        let _ = self.control.set_config(EngineConfig::from_store(&self.store));
+        let _ = self.store.store();
+    }
 }
 
 pub(crate) struct SettingsWindow {
@@ -2932,9 +2939,7 @@ impl SettingsState {
         let tray_host = {
             let mut s = self.shared.borrow_mut();
             edit(s.store.config_mut());
-            let next_cfg = EngineConfig::from_store(&s.store);
-            let _ = s.control.set_config(next_cfg);
-            let _ = s.store.store();
+            s.apply_change();
             s.tray_host
         };
         if retext {
@@ -3027,10 +3032,7 @@ impl SettingsState {
     }
 
     fn push_config_and_save(&self) {
-        let mut s = self.shared.borrow_mut();
-        let next_cfg = EngineConfig::from_store(&s.store);
-        let _ = s.control.set_config(next_cfg);
-        let _ = s.store.store();
+        self.shared.borrow_mut().apply_change();
     }
 
     /// Before leaving the selected properties (switching, restarting as administrator), after they
@@ -3359,9 +3361,7 @@ impl SettingsState {
                 }
             }
             if added_any {
-                let next = EngineConfig::from_store(&s.store);
-                let _ = s.control.set_config(next);
-                let _ = s.store.store();
+                s.apply_change();
             }
         }
         self.refresh_all();
@@ -3397,9 +3397,7 @@ impl SettingsState {
                 }
             }
             if removed_any {
-                let next = EngineConfig::from_store(&s.store);
-                let _ = s.control.set_config(next);
-                let _ = s.store.store();
+                s.apply_change();
             }
         }
         self.refresh_all();
