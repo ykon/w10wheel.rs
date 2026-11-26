@@ -131,6 +131,8 @@ struct TrayHostState {
     suspend_resume_notification: Option<Handle>,
     session_notification: bool,
     session_notification_retries: u32,
+    // A resume was notified since the suspend (see resume_resets_input)
+    resume_seen: bool,
 }
 
 pub(crate) fn main() -> ExitCode {
@@ -355,6 +357,7 @@ fn run(options: LaunchOptions) -> ExitCode {
         suspend_resume_notification: None,
         session_notification: false,
         session_notification_retries: 0,
+        resume_seen: false,
     });
 
     if let Err(err) = sync_tray(tray_host, &mut host_state) {
@@ -463,12 +466,16 @@ unsafe extern "system" fn tray_wnd_proc(
             }
         }
         WM_POWERBROADCAST if wparam == PBT_APMSUSPEND => {
+            state.resume_seen = false;
             on_input_lost(hwnd, state);
         }
         WM_POWERBROADCAST
             if wparam == PBT_APMRESUMEAUTOMATIC || wparam == PBT_APMRESUMESUSPEND =>
         {
-            on_input_lost(hwnd, state);
+            let automatic = wparam == PBT_APMRESUMEAUTOMATIC;
+            if resume_resets_input(&mut state.resume_seen, automatic) {
+                on_input_lost(hwnd, state);
+            }
             schedule_reinstall_hooks(hwnd, state);
         }
         WM_WTSSESSION_CHANGE if wparam == WTS_SESSION_LOCK => {
@@ -614,6 +621,23 @@ fn on_input_lost(hwnd: Handle, state: &mut TrayHostState) {
     let _ = state.control.input_lost();
     let hw = unsafe { w::HWND::from_ptr(hwnd) };
     state.cursor.set_axis(&hw, None);
+}
+
+/// A resume is notified once or twice: PBT_APMRESUMEAUTOMATIC first, always, and
+/// PBT_APMRESUMESUSPEND after it when the user wakes the system, maybe much later: at the first
+/// input after an automatic resume. The input is reset at PBT_APMRESUMEAUTOMATIC, always (also if
+/// the suspend was not notified), and at PBT_APMRESUMESUSPEND only if it came alone (none since the
+/// suspend): the hooks have seen the input since, and a reset would forget what they saw (a trigger
+/// key passed meanwhile would be taken as a new press: its repeats would start scroll mode, and its
+/// up be suppressed, the key left pressed in the application). The hooks are installed again after
+/// both (schedule_reinstall_hooks: from the last). As the Java and .NET versions do.
+/// `resume_seen` is set at a resume, cleared at the suspend.
+fn resume_resets_input(resume_seen: &mut bool, automatic: bool) -> bool {
+    if !automatic && *resume_seen {
+        return false;
+    }
+    *resume_seen = true;
+    true
 }
 
 /// The keyboard hook could not be installed (at startup, at a load, or turned on in the dialog): the
@@ -883,4 +907,24 @@ fn tray_menu(hwnd: Handle, lang: UiLanguage, paused: bool) -> w::AnyResult<Optio
         return Ok(None);
     }
     Ok(choice?.map(|command| command as u16))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resume_resets_input;
+
+    #[test]
+    fn resume_resets_input_once_per_resume() {
+        // Suspend (cleared), automatic resume, then the user's: reset at the first only
+        let mut seen = false;
+        assert!(resume_resets_input(&mut seen, true));
+        assert!(!resume_resets_input(&mut seen, false));
+        // The user's resume alone after a suspend: reset
+        seen = false;
+        assert!(resume_resets_input(&mut seen, false));
+        // An automatic resume always resets, also when the suspend was not notified
+        assert!(resume_resets_input(&mut seen, true));
+        assert!(resume_resets_input(&mut seen, true));
+        assert!(!resume_resets_input(&mut seen, false));
+    }
 }
