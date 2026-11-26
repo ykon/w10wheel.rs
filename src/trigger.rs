@@ -2,7 +2,7 @@ use crate::config::{Config, CustomTableState, Trigger, TriggerKey};
 use crate::exclusions::ExclusionMatcher;
 use crate::properties::ConfigStore;
 use crate::scroll::{ScrollAxis, ScrollConfig, ScrollSession, WheelEvent};
-use crate::sender::{KIND_DOWN, KIND_PLAIN, KIND_RELEASE, MouseButton, PRESS_ID_MASK, Point, ResendTags, ResentInfo};
+use crate::sender::{MouseButton, PRESS_ID_MASK, Point, ResendKind, ResendTags, ResentInfo};
 
 const KEY_COUNT: usize = 256;
 
@@ -149,7 +149,7 @@ struct Press {
     /// Its up has passed (or was dropped as a lone up, or may have been missed): a down of it
     /// resent later is dropped
     up_passed: bool,
-    /// The id of the press whose resent up (KIND_RELEASE) is queued, 0 when none is
+    /// The id of the press whose resent up (ResendKind::Release) is queued, 0 when none is
     release_queued_id: u32,
 }
 
@@ -168,11 +168,11 @@ impl ButtonTracker {
         &mut self.presses[button.index()]
     }
 
-    fn drop_resent(&self, button: MouseButton, is_down: bool, kind: usize, press_id: u32) -> bool {
+    fn drop_resent(&self, button: MouseButton, is_down: bool, kind: ResendKind, press_id: u32) -> bool {
         let p = self.press(button);
         match (is_down, kind) {
-            (true, KIND_DOWN) => (press_id != p.id || p.up_passed) && press_id != p.release_queued_id,
-            (false, KIND_RELEASE) => press_id != p.down_passed_id,
+            (true, ResendKind::Down) => (press_id != p.id || p.up_passed) && press_id != p.release_queued_id,
+            (false, ResendKind::Release) => press_id != p.down_passed_id,
             _ => false,
         }
     }
@@ -228,32 +228,35 @@ impl ButtonTracker {
         self.press_mut(button).release_queued_id = press_id;
     }
 
-    fn on_after_mouse(
-        &mut self,
-        button: MouseButton,
-        is_down: bool,
-        injected: bool,
-        kind: usize,
-        press_id: u32,
-        passed: bool,
-    ) {
+    /// After a physical event, passed or suppressed
+    fn on_after_physical(&mut self, button: MouseButton, is_down: bool, passed: bool) {
         let p = self.press_mut(button);
-        if !injected && is_down && !passed {
-            p.down_suppressed = true;
-            return;
+        match (is_down, passed) {
+            (true, true) => p.down_passed_id = p.id,
+            (true, false) => p.down_suppressed = true,
+            (false, true) => p.on_up_passed(),
+            (false, false) => {}
         }
-        if passed {
-            if is_down && kind == KIND_DOWN && injected {
-                p.down_passed_id = press_id;
-            } else if is_down && !injected {
-                p.down_passed_id = p.id;
-            } else if !is_down && (!injected || kind == KIND_RELEASE) {
-                p.down_passed_id = 0;
-                p.up_passed = true;
-                p.down_suppressed = false;
-                p.release_queued_id = 0;
-            }
+    }
+
+    /// After a resent event of ours that passed (one dropped by drop_resent did not)
+    fn on_after_resent(&mut self, button: MouseButton, is_down: bool, kind: ResendKind, press_id: u32) {
+        let p = self.press_mut(button);
+        match (is_down, kind) {
+            (true, ResendKind::Down) => p.down_passed_id = press_id,
+            (false, ResendKind::Release) => p.on_up_passed(),
+            _ => {}
         }
+    }
+}
+
+impl Press {
+    /// The up of the press reached the application: nothing of it is left down there
+    fn on_up_passed(&mut self) {
+        self.down_passed_id = 0;
+        self.up_passed = true;
+        self.down_suppressed = false;
+        self.release_queued_id = 0;
     }
 }
 
@@ -574,14 +577,8 @@ impl TriggerEngine {
         }
         if let Some(wait) = self.lr_wait {
             if !event.injected && event.point != wait.point {
-                self.lr_wait = None;
-                host.kill_poll_timer();
-                self.up_owners.set(wait.button, UpOwner::Resent);
-                host.send_down(
-                    wait.button,
-                    wait.point,
-                    self.tags.encode(KIND_DOWN, wait.press_id),
-                );
+                self.end_lr_wait(host);
+                self.resend_waiting_down(wait, host);
                 return false;
             }
             return true;
@@ -615,8 +612,7 @@ impl TriggerEngine {
                     if self.tracker.drop_resent(btn, is_down, kind, press_id) {
                         false
                     } else {
-                        self.tracker
-                            .on_after_mouse(btn, is_down, true, kind, press_id, true);
+                        self.tracker.on_after_resent(btn, is_down, kind, press_id);
                         true
                     }
                 }
@@ -661,11 +657,11 @@ impl TriggerEngine {
                 if owner == UpOwner::Resent {
                     let press_id = self.tracker.current_press_id(btn);
                     self.tracker.mark_release_queued(btn, press_id);
-                    host.send_up(btn, point, self.tags.encode(KIND_RELEASE, press_id));
+                    host.send_up(btn, point, self.tags.encode(ResendKind::Release, press_id));
                 }
             }
         }
-        self.tracker.on_after_mouse(btn, is_down, false, 0, 0, passed);
+        self.tracker.on_after_physical(btn, is_down, passed);
         passed
     }
 
@@ -678,11 +674,9 @@ impl TriggerEngine {
     ) -> bool {
         if let Some(wait) = self.lr_wait {
             if btn == wait.button {
-                self.lr_wait = None;
-                host.kill_poll_timer();
+                self.end_lr_wait(host);
             } else if self.is_second_double_button(btn, wait.button) {
-                self.lr_wait = None;
-                host.kill_poll_timer();
+                self.end_lr_wait(host);
                 self.up_owners.set(wait.button, UpOwner::Trigger);
                 self.up_owners.set(btn, UpOwner::Trigger);
                 if self.is_released_scroll() || self.is_keyboard_scroll() {
@@ -699,19 +693,13 @@ impl TriggerEngine {
                         [(wait.button, wait.point, wait.press_id), (btn, point, press_id)]
                     {
                         self.up_owners.set(button, UpOwner::Resent);
-                        host.send_down(button, at, self.tags.encode(KIND_DOWN, id));
+                        host.send_down(button, at, self.tags.encode(ResendKind::Down, id));
                     }
                 }
                 return false;
             } else {
-                self.lr_wait = None;
-                host.kill_poll_timer();
-                self.up_owners.set(wait.button, UpOwner::Resent);
-                host.send_down(
-                    wait.button,
-                    wait.point,
-                    self.tags.encode(KIND_DOWN, wait.press_id),
-                );
+                self.end_lr_wait(host);
+                self.resend_waiting_down(wait, host);
             }
         }
 
@@ -831,8 +819,7 @@ impl TriggerEngine {
     ) -> bool {
         if let Some(wait) = self.lr_wait {
             if btn == wait.button {
-                self.lr_wait = None;
-                host.kill_poll_timer();
+                self.end_lr_wait(host);
                 if point == wait.point {
                     host.send_click(btn, point, self.tags.click_tag());
                 } else {
@@ -840,7 +827,7 @@ impl TriggerEngine {
                         btn,
                         wait.point,
                         point,
-                        self.tags.encode(KIND_PLAIN, 0),
+                        self.tags.encode(ResendKind::Plain, 0),
                     );
                 }
                 return false;
@@ -852,15 +839,9 @@ impl TriggerEngine {
             if self.up_owners.get(btn) == UpOwner::Resent || self.tracker.would_drop_lone_up(btn) {
                 return true;
             }
-            self.lr_wait = None;
-            host.kill_poll_timer();
-            self.up_owners.set(wait.button, UpOwner::Resent);
-            host.send_down(
-                wait.button,
-                wait.point,
-                self.tags.encode(KIND_DOWN, wait.press_id),
-            );
-            host.send_up(btn, point, self.tags.encode(KIND_PLAIN, 0));
+            self.end_lr_wait(host);
+            self.resend_waiting_down(wait, host);
+            host.send_up(btn, point, self.tags.encode(ResendKind::Plain, 0));
             return false;
         }
 
@@ -1055,11 +1036,24 @@ impl TriggerEngine {
         if self.paused {
             return;
         }
+        self.resend_waiting_down(wait, host);
+    }
+
+    /// Ends the LR wait, if any, and its timer: its down is not resent
+    fn end_lr_wait(&mut self, host: &mut impl TriggerHost) {
+        if self.lr_wait.take().is_some() {
+            host.kill_poll_timer();
+        }
+    }
+
+    /// The down of the LR wait, ended with no pair, resent alone: its up passes (or its release is
+    /// resent, if the up is dropped as a lone up)
+    fn resend_waiting_down(&mut self, wait: LrWait, host: &mut impl TriggerHost) {
         self.up_owners.set(wait.button, UpOwner::Resent);
         host.send_down(
             wait.button,
             wait.point,
-            self.tags.encode(KIND_DOWN, wait.press_id),
+            self.tags.encode(ResendKind::Down, wait.press_id),
         );
     }
 
@@ -1189,8 +1183,8 @@ impl TriggerEngine {
 
     /// Ends the LR wait and the scroll, and forgets the records, as `reset` tells (see Reset)
     fn reset(&mut self, reset: Reset, host: &mut impl TriggerHost) {
-        if reset.mouse != MouseRecords::Keep && self.lr_wait.take().is_some() {
-            host.kill_poll_timer();
+        if reset.mouse != MouseRecords::Keep {
+            self.end_lr_wait(host);
         }
         let ends_scroll = match reset.scroll {
             EndScroll::Mouse => self.is_mouse_scroll(),
@@ -1515,7 +1509,7 @@ mod tests {
             other => panic!("unexpected timeout calls: {other:?}"),
         };
 
-        // Simulate physical Up arriving BEFORE resent KIND_DOWN reaches the hook.
+        // Simulate physical Up arriving BEFORE resent ResendKind::Down reaches the hook.
         assert_eq!(
             engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Left), 50, 60, 310), &mut host),
             HookDecision::Suppress
@@ -1528,12 +1522,12 @@ mod tests {
         assert_eq!(
             tags.decode(rel_extra),
             Some(ResentInfo::Button {
-                kind: KIND_RELEASE,
+                kind: ResendKind::Release,
                 press_id: 1
             })
         );
 
-        // Both KIND_DOWN(1) and KIND_RELEASE(1) must now be allowed to pass.
+        // Both ResendKind::Down(1) and ResendKind::Release(1) must now be allowed to pass.
         assert_eq!(
             engine.handle_mouse(
                 inj_mouse(HookMouseKind::Down(MouseButton::Left), 50, 60, 311, down_extra),
@@ -1919,15 +1913,15 @@ mod tests {
         assert_eq!(
             downs,
             vec![
-                (MouseButton::Left, Some(ResentInfo::Button { kind: KIND_DOWN, press_id: 1 })),
-                (MouseButton::Right, Some(ResentInfo::Button { kind: KIND_DOWN, press_id: 2 })),
+                (MouseButton::Left, Some(ResentInfo::Button { kind: ResendKind::Down, press_id: 1 })),
+                (MouseButton::Right, Some(ResentInfo::Button { kind: ResendKind::Down, press_id: 2 })),
             ]
         );
         // The resent downs reach the hook, then the physical ups pass (releasing them).
         for (btn, id) in [(MouseButton::Left, 1), (MouseButton::Right, 2)] {
             assert_eq!(
                 engine.handle_mouse(
-                    inj_mouse(HookMouseKind::Down(btn), 1, 2, 121, tags.encode(KIND_DOWN, id)),
+                    inj_mouse(HookMouseKind::Down(btn), 1, 2, 121, tags.encode(ResendKind::Down, id)),
                     &mut host
                 ),
                 HookDecision::Pass
@@ -1981,13 +1975,13 @@ mod tests {
             host.take_calls(),
             vec![
                 HostCall::KillTimer,
-                HostCall::Down(MouseButton::Left, Point { x: 5, y: 5 }, tags.encode(KIND_DOWN, 1)),
+                HostCall::Down(MouseButton::Left, Point { x: 5, y: 5 }, tags.encode(ResendKind::Down, 1)),
                 HostCall::SetTimer(50),
             ]
         );
         // The left up is released as that of a resent down
         engine.handle_mouse(
-            inj_mouse(HookMouseKind::Down(MouseButton::Left), 5, 5, 1081, tags.encode(KIND_DOWN, 1)),
+            inj_mouse(HookMouseKind::Down(MouseButton::Left), 5, 5, 1081, tags.encode(ResendKind::Down, 1)),
             &mut host,
         );
         assert_eq!(

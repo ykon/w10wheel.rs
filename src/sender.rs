@@ -14,9 +14,27 @@ const DEFAULT_CLICK_DELAY: Duration = Duration::from_millis(10);
 // the secure desktop of UAC is shown, SendInput fails): given up, the button would stay pressed.
 const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
-pub const KIND_PLAIN: usize = 0;
-pub const KIND_DOWN: usize = 1;
-pub const KIND_RELEASE: usize = 2;
+/// What a resent button event is, told in its dwExtraInfo (ResendTags)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResendKind {
+    /// Nothing to tell of it (e.g. the up of another button sent after the waiting down)
+    Plain = 0,
+    /// A down resent alone (the LR wait ended with no pair)
+    Down = 1,
+    /// The up of such a down, resent as its physical up was dropped as a lone up
+    Release = 2,
+}
+
+impl ResendKind {
+    const fn from_bits(extra_info: usize) -> Option<Self> {
+        match extra_info & KIND_MASK {
+            0 => Some(Self::Plain),
+            1 => Some(Self::Down),
+            2 => Some(Self::Release),
+            _ => None,
+        }
+    }
+}
 
 const KIND_MASK: usize = 0x03;
 const PRESS_ID_SHIFT: u32 = 2;
@@ -89,7 +107,7 @@ pub struct Point {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResentInfo {
     Click,
-    Button { kind: usize, press_id: u32 },
+    Button { kind: ResendKind, press_id: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,20 +130,24 @@ impl ResendTags {
         self.resend_click_tag
     }
 
-    pub const fn encode(self, kind: usize, press_id: u32) -> usize {
+    pub const fn encode(self, kind: ResendKind, press_id: u32) -> usize {
         self.resend_tag
             | (((press_id as usize) & (PRESS_ID_MASK as usize)) << PRESS_ID_SHIFT)
-            | (kind & KIND_MASK)
+            | kind as usize
     }
 
     pub const fn decode(self, extra_info: usize) -> Option<ResentInfo> {
         if extra_info == self.resend_click_tag {
             Some(ResentInfo::Click)
         } else if (extra_info & TAG_MASK) == self.resend_tag && (extra_info & CLICK_TAG_BIT) == 0 {
-            Some(ResentInfo::Button {
-                kind: extra_info & KIND_MASK,
-                press_id: ((extra_info >> PRESS_ID_SHIFT) & (PRESS_ID_MASK as usize)) as u32,
-            })
+            match ResendKind::from_bits(extra_info) {
+                Some(kind) => Some(ResentInfo::Button {
+                    kind,
+                    press_id: ((extra_info >> PRESS_ID_SHIFT) & (PRESS_ID_MASK as usize)) as u32,
+                }),
+                // Not of a kind sent: not ours
+                None => None,
+            }
         } else {
             None
         }
@@ -346,13 +368,13 @@ struct SenderWorker<S: SendSink> {
     button_queue: VecDeque<ButtonAction>,
     unsent_ups: Vec<UnsentUp>,
     last_down_sent: [Option<Instant>; MouseButton::COUNT],
-    // The press of the last down resent alone (KIND_DOWN) that was sent, by button (0: none): at
-    // exit the up resent for such a down (KIND_RELEASE) is sent only if that down was
+    // The press of the last down resent alone (ResendKind::Down) that was sent, by button (0: none): at
+    // exit the up resent for such a down (ResendKind::Release) is sent only if that down was
     sent_down_id: [u32; MouseButton::COUNT],
 }
 
-fn kind_of(extra_info: usize) -> usize {
-    extra_info & KIND_MASK
+fn kind_of(extra_info: usize) -> Option<ResendKind> {
+    ResendKind::from_bits(extra_info)
 }
 
 fn press_id_of(extra_info: usize) -> u32 {
@@ -385,7 +407,7 @@ impl<S: SendSink> SenderWorker<S> {
             ButtonAction::Up {
                 button, extra_info, ..
             } => {
-                kind_of(extra_info) != KIND_RELEASE
+                kind_of(extra_info) != Some(ResendKind::Release)
                     || press_id_of(extra_info) == self.sent_down_id[button.index()]
             }
             _ => false,
@@ -524,7 +546,7 @@ impl<S: SendSink> SenderWorker<S> {
             extra_info,
         }) {
             self.last_down_sent[button.index()] = Some(Instant::now());
-            if kind_of(extra_info) == KIND_DOWN {
+            if kind_of(extra_info) == Some(ResendKind::Down) {
                 self.sent_down_id[button.index()] = press_id_of(extra_info);
             }
         }
@@ -696,22 +718,24 @@ mod tests {
         assert_eq!(tags_a.decode(0), None);
         assert_eq!(tags_a.decode(0x1234_5678), None);
 
-        let down = tags_a.encode(KIND_DOWN, 42);
+        let down = tags_a.encode(ResendKind::Down, 42);
         assert_eq!(
             tags_a.decode(down),
             Some(ResentInfo::Button {
-                kind: KIND_DOWN,
+                kind: ResendKind::Down,
                 press_id: 42
             })
         );
-        let rel = tags_a.encode(KIND_RELEASE, 16383);
+        let rel = tags_a.encode(ResendKind::Release, 16383);
         assert_eq!(
             tags_a.decode(rel),
             Some(ResentInfo::Button {
-                kind: KIND_RELEASE,
+                kind: ResendKind::Release,
                 press_id: 16383
             })
         );
+        // The kind bits of no ResendKind (3): not ours
+        assert_eq!(tags_a.decode(tags_a.encode(ResendKind::Plain, 7) | 0x03), None);
     }
 
     /// A sink whose first send waits until the test releases it: the sender thread stalls (e.g.
@@ -863,12 +887,12 @@ mod tests {
         handle.send_down(
             MouseButton::Left,
             Point { x: 10, y: 20 },
-            tags.encode(KIND_DOWN, 7),
+            tags.encode(ResendKind::Down, 7),
         );
         handle.send_up(
             MouseButton::Left,
             Point { x: 12, y: 22 },
-            tags.encode(KIND_RELEASE, 7),
+            tags.encode(ResendKind::Release, 7),
         );
 
         thread::sleep(Duration::from_millis(35));
@@ -881,12 +905,12 @@ mod tests {
                 SendPacket::ButtonDown {
                     button: MouseButton::Left,
                     point: Point { x: 10, y: 20 },
-                    extra_info: tags.encode(KIND_DOWN, 7),
+                    extra_info: tags.encode(ResendKind::Down, 7),
                 },
                 SendPacket::ButtonUp {
                     button: MouseButton::Left,
                     point: Point { x: 12, y: 22 },
-                    extra_info: tags.encode(KIND_RELEASE, 7),
+                    extra_info: tags.encode(ResendKind::Release, 7),
                 },
             ]
         );
@@ -905,8 +929,8 @@ mod tests {
         );
         let handle = sender.handle();
         let tags = ResendTags::next_unique();
-        let left_down = tags.encode(KIND_DOWN, 3);
-        let left_up = tags.encode(KIND_RELEASE, 3);
+        let left_down = tags.encode(ResendKind::Down, 3);
+        let left_up = tags.encode(ResendKind::Release, 3);
 
         handle.send_down(MouseButton::Left, Point { x: 1, y: 1 }, left_down);
         handle.send_up(MouseButton::Left, Point { x: 1, y: 1 }, left_up);
@@ -961,12 +985,12 @@ mod tests {
         let tags = ResendTags::next_unique();
 
         // Sent before exit: the left down resent alone (press 5)
-        handle.send_down(MouseButton::Left, Point { x: 1, y: 1 }, tags.encode(KIND_DOWN, 5));
+        handle.send_down(MouseButton::Left, Point { x: 1, y: 1 }, tags.encode(ResendKind::Down, 5));
         // A click in progress (its up waits for the click delay), then queued behind it
         handle.send_click(MouseButton::Middle, Point { x: 2, y: 2 }, tags.click_tag());
-        handle.send_down(MouseButton::Right, Point { x: 3, y: 3 }, tags.encode(KIND_DOWN, 6));
-        handle.send_up(MouseButton::Right, Point { x: 3, y: 3 }, tags.encode(KIND_RELEASE, 6));
-        handle.send_up(MouseButton::Left, Point { x: 1, y: 1 }, tags.encode(KIND_RELEASE, 5));
+        handle.send_down(MouseButton::Right, Point { x: 3, y: 3 }, tags.encode(ResendKind::Down, 6));
+        handle.send_up(MouseButton::Right, Point { x: 3, y: 3 }, tags.encode(ResendKind::Release, 6));
+        handle.send_up(MouseButton::Left, Point { x: 1, y: 1 }, tags.encode(ResendKind::Release, 5));
         thread::sleep(Duration::from_millis(5));
         sender.close();
 
@@ -977,7 +1001,7 @@ mod tests {
                 SendPacket::ButtonDown {
                     button: MouseButton::Left,
                     point: Point { x: 1, y: 1 },
-                    extra_info: tags.encode(KIND_DOWN, 5),
+                    extra_info: tags.encode(ResendKind::Down, 5),
                 },
                 SendPacket::ButtonDown {
                     button: MouseButton::Middle,
@@ -995,7 +1019,7 @@ mod tests {
                 SendPacket::ButtonUp {
                     button: MouseButton::Left,
                     point: Point { x: 1, y: 1 },
-                    extra_info: tags.encode(KIND_RELEASE, 5),
+                    extra_info: tags.encode(ResendKind::Release, 5),
                 },
             ]
         );
@@ -1016,12 +1040,12 @@ mod tests {
             MouseButton::Left,
             Point { x: 1, y: 2 },
             Point { x: 3, y: 4 },
-            tags.encode(KIND_PLAIN, 0),
+            tags.encode(ResendKind::Plain, 0),
         );
         handle.send_down(
             MouseButton::Right,
             Point { x: 5, y: 6 },
-            tags.encode(KIND_DOWN, 1),
+            tags.encode(ResendKind::Down, 1),
         );
 
         // Before closing: a down still queued at exit is not sent
@@ -1035,17 +1059,17 @@ mod tests {
                 SendPacket::ButtonDown {
                     button: MouseButton::Left,
                     point: Point { x: 1, y: 2 },
-                    extra_info: tags.encode(KIND_PLAIN, 0),
+                    extra_info: tags.encode(ResendKind::Plain, 0),
                 },
                 SendPacket::ButtonUp {
                     button: MouseButton::Left,
                     point: Point { x: 3, y: 4 },
-                    extra_info: tags.encode(KIND_PLAIN, 0),
+                    extra_info: tags.encode(ResendKind::Plain, 0),
                 },
                 SendPacket::ButtonDown {
                     button: MouseButton::Right,
                     point: Point { x: 5, y: 6 },
-                    extra_info: tags.encode(KIND_DOWN, 1),
+                    extra_info: tags.encode(ResendKind::Down, 1),
                 },
             ]
         );

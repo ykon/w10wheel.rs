@@ -47,7 +47,7 @@ pub fn send_command(command: &IpcCommand) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sender::{KIND_DOWN, KIND_RELEASE, ResendTags};
+    use crate::sender::{ResendKind, ResendTags};
 
     #[test]
     fn encodes_and_decodes_all_w10_messages_with_exact_constants() {
@@ -90,7 +90,7 @@ mod tests {
 
         let tags = ResendTags::next_unique();
         assert_eq!(decode_command(tags.click_tag()), None);
-        assert_eq!(decode_command(tags.encode(KIND_DOWN, 1)), None);
-        assert_eq!(decode_command(tags.encode(KIND_RELEASE, 42)), None);
+        assert_eq!(decode_command(tags.encode(ResendKind::Down, 1)), None);
+        assert_eq!(decode_command(tags.encode(ResendKind::Release, 42)), None);
     }
 }
