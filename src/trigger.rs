@@ -258,33 +258,44 @@ impl LastFlags {
     }
 }
 
-struct KeyFlags {
-    kd_suppressed: [bool; KEY_COUNT],
-    kd_passed: [bool; KEY_COUNT],
-    kd_lone_up: [bool; KEY_COUNT],
-    last_key_event: Option<(u32, KeyAction)>,
+/// What is known of a key's press, for its repeats and its up
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum KeyState {
+    /// Not pressed, as far as is known: its next down is a new press
+    #[default]
+    Idle,
+    /// Its down was suppressed: its repeats and its up are too
+    Suppressed,
+    /// Its down passed: its repeats and its up pass too
+    Passed,
+    /// Its down was suppressed, then the triggers were reset (init_state): its up alone is still
+    /// suppressed, a new down is a new press
+    LoneUp,
 }
 
-impl Default for KeyFlags {
+struct KeyStates([KeyState; KEY_COUNT]);
+
+impl Default for KeyStates {
     fn default() -> Self {
-        Self {
-            kd_suppressed: [false; KEY_COUNT],
-            kd_passed: [false; KEY_COUNT],
-            kd_lone_up: [false; KEY_COUNT],
-            last_key_event: None,
-        }
+        Self([KeyState::Idle; KEY_COUNT])
     }
 }
 
-impl KeyFlags {
+impl KeyStates {
+    fn get(&self, vk: usize) -> KeyState {
+        self.0[vk]
+    }
+
+    fn set(&mut self, vk: usize, state: KeyState) {
+        self.0[vk] = state;
+    }
+
     fn suppressed_to_lone_up(&mut self) {
-        for vk in 0..KEY_COUNT {
-            if self.kd_suppressed[vk] {
-                self.kd_suppressed[vk] = false;
-                self.kd_lone_up[vk] = true;
+        for state in &mut self.0 {
+            if *state == KeyState::Suppressed {
+                *state = KeyState::LoneUp;
             }
         }
-        self.last_key_event = None;
     }
 
     /// The keyboard hook is removed, or keys were not seen (the session locked): the ups will not
@@ -366,7 +377,7 @@ pub struct TriggerEngine {
     generation: u64,
     tracker: ButtonTracker,
     last_flags: LastFlags,
-    key_flags: KeyFlags,
+    keys: KeyStates,
     last_mouse_event: Option<(MouseButton, bool)>,
     lr_wait: Option<LrWait>,
     scroll: Option<ActiveScroll>,
@@ -382,7 +393,7 @@ impl TriggerEngine {
             generation: 0,
             tracker: ButtonTracker::default(),
             last_flags: LastFlags::default(),
-            key_flags: KeyFlags::default(),
+            keys: KeyStates::default(),
             last_mouse_event: None,
             lr_wait: None,
             scroll: None,
@@ -739,14 +750,6 @@ impl TriggerEngine {
             return false;
         }
 
-        if self.last_flags.resent_down[btn.index()] {
-            self.last_mouse_event = Some((btn, false));
-            return true;
-        }
-
-        if self.last_mouse_event == Some((btn, false)) {
-            return true;
-        }
         self.last_mouse_event = Some((btn, false));
         true
     }
@@ -824,26 +827,30 @@ impl TriggerEngine {
 
         match event.action {
             KeyAction::Down => {
-                if event.vk_code == VK_PAUSE && is_trigger_key && self.key_flags.kd_suppressed[vk] {
-                    self.key_flags.kd_suppressed[vk] = false;
-                    self.key_flags.last_key_event = Some((event.vk_code, KeyAction::Up));
-                    if self.is_released_scroll() || self.is_pressed_keyboard_scroll() {
-                        self.exit_scroll(host);
+                // Pause does not repeat: its down is always a new press. Down again while its
+                // first down is suppressed, it ends the scroll (it toggles it).
+                if event.vk_code == VK_PAUSE && is_trigger_key {
+                    match self.keys.get(vk) {
+                        KeyState::Suppressed => {
+                            self.keys.set(vk, KeyState::Idle);
+                            if self.is_released_scroll() || self.is_pressed_keyboard_scroll() {
+                                self.exit_scroll(host);
+                            }
+                            return false;
+                        }
+                        KeyState::Passed => self.keys.set(vk, KeyState::Idle),
+                        KeyState::Idle | KeyState::LoneUp => {}
                     }
-                    return false;
-                }
-                if event.vk_code == VK_PAUSE && is_trigger_key && self.key_flags.kd_passed[vk] {
-                    self.key_flags.kd_passed[vk] = false;
                 }
 
-                if self.key_flags.kd_suppressed[vk] {
-                    return false;
-                }
-                if self.key_flags.kd_passed[vk] {
-                    return true;
+                match self.keys.get(vk) {
+                    KeyState::Suppressed => return false,
+                    KeyState::Passed => return true,
+                    KeyState::Idle | KeyState::LoneUp => {}
                 }
 
-                self.key_flags.kd_lone_up[vk] = false;
+                // A new press: the lone up left by a reset is not to come any more
+                self.keys.set(vk, KeyState::Idle);
                 // Already down in the system: in the hook, GetAsyncKeyState still tells the state
                 // from before this event, so this is a repeat of a press whose down reached the
                 // application with no record of it here. E.g. passed just before an InputLost
@@ -853,20 +860,19 @@ impl TriggerEngine {
                 // one) and be suppressed, its up too, the key left pressed in the application.
                 // Not Pause, which does not repeat: its down is always a new press.
                 if event.vk_code != VK_PAUSE && host.is_key_down(event.vk_code) {
-                    self.key_flags.kd_passed[vk] = true;
+                    self.keys.set(vk, KeyState::Passed);
                     return true;
                 }
 
                 if is_trigger_key {
                     if self.is_released_scroll() || self.is_mouse_scroll() {
-                        self.key_flags.last_key_event = Some((event.vk_code, KeyAction::Down));
                         self.exit_scroll(host);
-                        self.key_flags.kd_suppressed[vk] = true;
+                        self.keys.set(vk, KeyState::Suppressed);
                         return false;
                     }
                     if host.is_excluded(host.cursor_pos(), &self.config.exclusions) {
                         if event.vk_code != VK_PAUSE {
-                            self.key_flags.kd_passed[vk] = true;
+                            self.keys.set(vk, KeyState::Passed);
                         }
                         return true;
                     }
@@ -879,60 +885,50 @@ impl TriggerEngine {
                         // Scroll mode could not start: the key passes as if it were not the
                         // trigger (its repeats and its up too)
                         if event.vk_code != VK_PAUSE {
-                            self.key_flags.kd_passed[vk] = true;
+                            self.keys.set(vk, KeyState::Passed);
                         }
                         return true;
                     }
-                    self.key_flags.last_key_event = Some((event.vk_code, KeyAction::Down));
-                    self.key_flags.kd_suppressed[vk] = true;
+                    self.keys.set(vk, KeyState::Suppressed);
                     return false;
                 }
 
                 if self.is_released_scroll() {
                     self.exit_scroll(host);
-                    self.key_flags.kd_suppressed[vk] = true;
+                    self.keys.set(vk, KeyState::Suppressed);
                     return false;
                 }
 
-                self.key_flags.kd_passed[vk] = true;
+                self.keys.set(vk, KeyState::Passed);
                 true
             }
-            KeyAction::Up => {
-                if self.key_flags.kd_suppressed[vk] {
-                    self.key_flags.kd_suppressed[vk] = false;
-                    if is_trigger_key {
-                        self.key_flags.last_key_event = Some((event.vk_code, KeyAction::Up));
-                        if self.is_pressed_keyboard_scroll() {
-                            let started_at = self.scroll.as_ref().map_or(event.time, |s| s.started_at);
-                            if event.time.wrapping_sub(started_at)
-                                <= self.config.trigger.scroll_locktime_ms
-                            {
-                                if let Some(scroll) = &mut self.scroll {
-                                    scroll.released = true;
-                                }
-                            } else {
-                                self.exit_scroll(host);
+            KeyAction::Up => match self.keys.get(vk) {
+                KeyState::Suppressed => {
+                    self.keys.set(vk, KeyState::Idle);
+                    if is_trigger_key && self.is_pressed_keyboard_scroll() {
+                        let started_at = self.scroll.as_ref().map_or(event.time, |s| s.started_at);
+                        if event.time.wrapping_sub(started_at)
+                            <= self.config.trigger.scroll_locktime_ms
+                        {
+                            if let Some(scroll) = &mut self.scroll {
+                                scroll.released = true;
                             }
+                        } else {
+                            self.exit_scroll(host);
                         }
                     }
-                    return false;
+                    false
                 }
-
-                if self.key_flags.kd_lone_up[vk] {
-                    self.key_flags.kd_lone_up[vk] = false;
-                    if is_trigger_key {
-                        self.key_flags.last_key_event = Some((event.vk_code, KeyAction::Up));
-                    }
-                    return false;
+                KeyState::LoneUp => {
+                    self.keys.set(vk, KeyState::Idle);
+                    false
                 }
-
-                if self.key_flags.kd_passed[vk] {
-                    self.key_flags.kd_passed[vk] = false;
-                    return true;
+                KeyState::Passed => {
+                    self.keys.set(vk, KeyState::Idle);
+                    true
                 }
-
-                true
-            }
+                KeyState::Idle => true,
+            },
         }
     }
 
@@ -1016,7 +1012,7 @@ impl TriggerEngine {
         }
         self.exit_scroll(host);
         self.last_flags.reset();
-        self.key_flags.suppressed_to_lone_up();
+        self.keys.suppressed_to_lone_up();
         self.last_mouse_event = None;
     }
 
@@ -1050,7 +1046,7 @@ impl TriggerEngine {
         if self.is_keyboard_scroll() {
             self.exit_scroll(host);
         }
-        self.key_flags.reset();
+        self.keys.reset();
         self.pass_held_trigger_key(host);
     }
 
@@ -1075,7 +1071,7 @@ impl TriggerEngine {
             && vk < KEY_COUNT
             && host.is_key_down(trigger)
         {
-            self.key_flags.kd_passed[vk] = true;
+            self.keys.set(vk, KeyState::Passed);
         }
     }
 
@@ -1087,13 +1083,13 @@ impl TriggerEngine {
     pub fn on_input_lost(&mut self, host: &mut impl TriggerHost) {
         self.init_state(host);
         self.tracker.forget_presses();
-        self.key_flags.reset();
+        self.keys.reset();
     }
 
     /// The keyboard hook has been removed (keyboard trigger off, or it could not be installed):
     /// its records are reset and the scroll mode of the trigger key is ended.
     pub fn on_keyboard_hook_removed(&mut self, host: &mut impl TriggerHost) {
-        self.key_flags.reset();
+        self.keys.reset();
         if self.is_keyboard_scroll() {
             self.exit_scroll(host);
         }
@@ -2366,6 +2362,184 @@ mod tests {
         kb.on_keyboard_hook_removed(&mut host);
         kb.on_keyboard_hook_installed(&mut host);
         assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 400), &mut host), HookDecision::Suppress);
+        assert!(kb.is_scrolling());
+    }
+
+    /// The keyboard trigger on `target`, the mouse trigger on Middle (scroll_locktime 200 ms)
+    fn kb_engine(target: TriggerKey) -> (TriggerEngine, MockHost, u32) {
+        let mut cfg = Config::default();
+        cfg.first_trigger = Trigger::Middle;
+        cfg.keyboard_hook = true;
+        cfg.target_vk_code = target;
+        let engine = TriggerEngine::new(
+            EngineConfig::from_config(&cfg, &CustomTableState::default()),
+            ResendTags::next_unique(),
+        );
+        (engine, MockHost::new(), target.vk_code())
+    }
+
+    #[test]
+    fn other_keys_pass_their_down_repeats_and_up() {
+        let (mut kb, mut host, _) = kb_engine(TriggerKey::VkLmenu);
+        let k = 0x41;
+        for (action, time) in [(KeyAction::Down, 10), (KeyAction::Down, 40), (KeyAction::Up, 60)] {
+            assert_eq!(kb.handle_key(key(k, action, time), &mut host), HookDecision::Pass);
+        }
+        // An up with no down seen passes too
+        assert_eq!(kb.handle_key(key(k, KeyAction::Up, 70), &mut host), HookDecision::Pass);
+        // A code out of the table passes, untouched
+        for action in [KeyAction::Down, KeyAction::Up] {
+            assert_eq!(kb.handle_key(key(0x1FF, action, 80), &mut host), HookDecision::Pass);
+        }
+        assert!(!kb.is_scrolling());
+    }
+
+    #[test]
+    fn trigger_key_up_ends_or_releases_the_scroll_by_the_locktime() {
+        let (mut kb, mut host, vk) = kb_engine(TriggerKey::VkLmenu);
+
+        // Held longer than the locktime: its repeats are suppressed, and its up ends the scroll
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 100), &mut host), HookDecision::Suppress);
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 130), &mut host), HookDecision::Suppress);
+        assert!(kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 500), &mut host), HookDecision::Suppress);
+        assert!(!kb.is_scrolling());
+
+        // Released within the locktime: the scroll goes on, released
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 600), &mut host), HookDecision::Suppress);
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 700), &mut host), HookDecision::Suppress);
+        assert!(kb.is_scrolling());
+
+        // Another key ends the released scroll: its down, its repeats and its up are suppressed
+        let k = 0x41;
+        assert_eq!(kb.handle_key(key(k, KeyAction::Down, 800), &mut host), HookDecision::Suppress);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(k, KeyAction::Down, 830), &mut host), HookDecision::Suppress);
+        assert_eq!(kb.handle_key(key(k, KeyAction::Up, 850), &mut host), HookDecision::Suppress);
+        // Its next press passes
+        assert_eq!(kb.handle_key(key(k, KeyAction::Down, 900), &mut host), HookDecision::Pass);
+        assert_eq!(kb.handle_key(key(k, KeyAction::Up, 950), &mut host), HookDecision::Pass);
+
+        // The trigger key ends a released scroll of its own: suppressed until its up
+        kb.handle_key(key(vk, KeyAction::Down, 1000), &mut host);
+        kb.handle_key(key(vk, KeyAction::Up, 1050), &mut host);
+        assert!(kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 1100), &mut host), HookDecision::Suppress);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 1130), &mut host), HookDecision::Suppress);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 1500), &mut host), HookDecision::Suppress);
+        assert!(!kb.is_scrolling());
+    }
+
+    #[test]
+    fn trigger_key_ends_a_mouse_scroll_and_is_suppressed_until_its_up() {
+        let (mut kb, mut host, vk) = kb_engine(TriggerKey::VkLmenu);
+        kb.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Middle), 0, 0, 100), &mut host);
+        assert!(kb.is_scrolling());
+
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 200), &mut host), HookDecision::Suppress);
+        assert!(!kb.is_scrolling());
+        // Its repeats do not start a scroll of their own
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 230), &mut host), HookDecision::Suppress);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 300), &mut host), HookDecision::Suppress);
+        assert!(!kb.is_scrolling());
+
+        // Its next press is the trigger
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 400), &mut host), HookDecision::Suppress);
+        assert!(kb.is_scrolling());
+    }
+
+    #[test]
+    fn reset_leaves_the_up_of_a_suppressed_key_to_be_suppressed_alone() {
+        let (mut kb, mut host, vk) = kb_engine(TriggerKey::VkLmenu);
+
+        // The trigger key in its scroll, reset (--sendInitState): its up is suppressed alone, as
+        // its down was, and only that one up
+        kb.handle_key(key(vk, KeyAction::Down, 100), &mut host);
+        kb.init_state(&mut host);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 200), &mut host), HookDecision::Suppress);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 250), &mut host), HookDecision::Pass);
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 300), &mut host), HookDecision::Suppress);
+        assert!(kb.is_scrolling());
+        kb.handle_key(key(vk, KeyAction::Up, 350), &mut host);
+
+        // Pressed again before that up (its up missed): the new down is a press of its own, the
+        // trigger, and the lone up is forgotten
+        kb.init_state(&mut host);
+        kb.handle_key(key(vk, KeyAction::Down, 400), &mut host);
+        kb.init_state(&mut host);
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Down, 500), &mut host), HookDecision::Suppress);
+        assert!(kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 1000), &mut host), HookDecision::Suppress);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 1050), &mut host), HookDecision::Pass);
+
+        // Another key suppressed as it ended a released scroll: its up too
+        let k = 0x41;
+        kb.handle_key(key(vk, KeyAction::Down, 1100), &mut host);
+        kb.handle_key(key(vk, KeyAction::Up, 1150), &mut host);
+        assert_eq!(kb.handle_key(key(k, KeyAction::Down, 1200), &mut host), HookDecision::Suppress);
+        kb.init_state(&mut host);
+        assert_eq!(kb.handle_key(key(k, KeyAction::Up, 1300), &mut host), HookDecision::Suppress);
+
+        // A key passed keeps passing: its up passes after the reset
+        assert_eq!(kb.handle_key(key(k, KeyAction::Down, 1400), &mut host), HookDecision::Pass);
+        kb.init_state(&mut host);
+        assert_eq!(kb.handle_key(key(k, KeyAction::Up, 1500), &mut host), HookDecision::Pass);
+
+        // The input lost (a lock, a suspend...): nothing is kept, the up passes
+        kb.handle_key(key(vk, KeyAction::Down, 1600), &mut host);
+        kb.on_input_lost(&mut host);
+        assert_eq!(kb.handle_key(key(vk, KeyAction::Up, 1700), &mut host), HookDecision::Pass);
+    }
+
+    #[test]
+    fn pause_key_down_is_always_a_new_press() {
+        use crate::exclusions::ExclusionList;
+
+        let excluded_pt = Point { x: 100, y: 100 };
+        let mut cfg = Config::default();
+        cfg.first_trigger = Trigger::Middle;
+        cfg.keyboard_hook = true;
+        cfg.target_vk_code = TriggerKey::VkPause;
+        let matcher = ExclusionList::from_lines(["C:\\Games\\game.exe"]).to_matcher();
+        let mut kb = TriggerEngine::new(
+            EngineConfig::from_config(&cfg, &CustomTableState::default()).with_exclusions(matcher),
+            ResendTags::next_unique(),
+        );
+        let mut host = MockHost::new();
+        host.excluded_points.push(excluded_pt);
+
+        // Passed over an excluded window, but not kept as passed: the next down is the trigger,
+        // also told down in the system (Pause does not repeat)
+        host.cursor = excluded_pt;
+        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Down, 10), &mut host), HookDecision::Pass);
+        host.cursor = Point { x: 20, y: 20 };
+        host.keys_down.push(VK_PAUSE);
+        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Down, 50), &mut host), HookDecision::Suppress);
+        assert!(kb.is_scrolling());
+        host.keys_down.clear();
+
+        // Released within the locktime: the next down ends the released scroll, suppressed with
+        // its up
+        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Up, 100), &mut host), HookDecision::Suppress);
+        assert!(kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Down, 400), &mut host), HookDecision::Suppress);
+        assert!(!kb.is_scrolling());
+        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Up, 450), &mut host), HookDecision::Suppress);
+
+        // Passed while it was not the trigger, then made the trigger while still down: its next
+        // down is a new press, the trigger
+        let mut lmenu = cfg.clone();
+        lmenu.target_vk_code = TriggerKey::VkLmenu;
+        kb.set_config(EngineConfig::from_config(&lmenu, &CustomTableState::default()), &mut host);
+        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Down, 500), &mut host), HookDecision::Pass);
+        kb.set_config(EngineConfig::from_config(&cfg, &CustomTableState::default()), &mut host);
+        assert_eq!(kb.handle_key(key(VK_PAUSE, KeyAction::Down, 600), &mut host), HookDecision::Suppress);
         assert!(kb.is_scrolling());
     }
 }
