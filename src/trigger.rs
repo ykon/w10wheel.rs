@@ -155,7 +155,8 @@ struct Press {
     up_passed: bool,
     /// The ids of the presses whose resent up (ResendKind::Release) is queued for their down
     /// resent alone, in order until each up reaches the hook (evicting the oldest past
-    /// MAX_RELEASES_QUEUED)
+    /// MAX_RELEASES_QUEUED). Cleared if a later physical down passes directly to the application,
+    /// so a stale resent click cannot break or reorder after that press.
     releases_queued: VecDeque<u32>,
 }
 
@@ -242,7 +243,10 @@ impl ButtonTracker {
     fn on_after_physical(&mut self, button: MouseButton, is_down: bool, passed: bool) {
         let p = self.press_mut(button);
         match (is_down, passed) {
-            (true, true) => p.down_passed_id = p.id,
+            (true, true) => {
+                p.down_passed_id = p.id;
+                p.releases_queued.clear();
+            }
             (true, false) => p.down_suppressed = true,
             (false, true) => {
                 p.down_passed_id = 0;
@@ -3198,7 +3202,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_release_arriving_during_or_after_later_press_keeps_both_intact() {
+    fn queued_release_arriving_during_later_suppressed_press_keeps_both_intact() {
         // A: a queued Release arriving while a later Left press is waiting does not mark that
         // later press as up_passed (its timed-out Down still passes, and its Up passes).
         let (mut engine, tags, mut host) = base_engine(Trigger::Lr);
@@ -3257,25 +3261,84 @@ mod tests {
             engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Left), 10, 10, 250), &mut host),
             HookDecision::Suppress
         );
+    }
 
-        // C: a subsequent press that passes physically (over an excluded window) does not clear an
-        // earlier press's queued Release.
+    #[test]
+    fn passed_physical_down_drops_earlier_queued_release_so_hold_is_not_broken() {
         use crate::exclusions::ExclusionList;
-        let excluded_pt = Point { x: 100, y: 100 };
-        let cfg = Config {
-            first_trigger: Trigger::Lr,
-            ..Config::default()
-        };
-        let matcher = ExclusionList::from_lines(["C:\\Games\\game.exe"]).to_matcher();
-        let mut engine = TriggerEngine::new(
-            EngineConfig::from_config(&cfg, &CustomTableState::default()).with_exclusions(matcher),
-            ResendTags::next_unique(),
-        );
-        let mut host = MockHost::new();
-        host.excluded_points.push(excluded_pt);
 
+        let excluded_pt = Point { x: 100, y: 100 };
+        let setup = || {
+            let cfg = Config {
+                first_trigger: Trigger::Lr,
+                ..Config::default()
+            };
+            let matcher = ExclusionList::from_lines(["C:\\Games\\game.exe"]).to_matcher();
+            let engine = TriggerEngine::new(
+                EngineConfig::from_config(&cfg, &CustomTableState::default()).with_exclusions(matcher),
+                ResendTags::next_unique(),
+            );
+            let mut host = MockHost::new();
+            host.excluded_points.push(excluded_pt);
+            (engine, host)
+        };
+
+        // 1. Resent Down and Release arrive while a later physical press on an excluded window is
+        // still held: both are dropped so the hold/drag is not released early.
+        let (mut engine, mut host) = setup();
         queue_lr_wait_ended_by_x1(&mut engine, &mut host, 10, 10, 100);
-        let resent1 = take_resent_button_calls(&mut host);
+        let resent = take_resent_button_calls(&mut host);
+        assert_eq!(resent.len(), 2);
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 100, 100, 200), &mut host),
+            HookDecision::Pass
+        );
+        for (idx, (kind, pt, extra)) in resent.into_iter().enumerate() {
+            assert_eq!(
+                engine.handle_mouse(inj_mouse(kind, pt.x, pt.y, 210 + idx as u32, extra), &mut host),
+                HookDecision::Suppress
+            );
+        }
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Left), 100, 100, 300), &mut host),
+            HookDecision::Pass
+        );
+
+        // 2. Resent Down passed before the later physical press, then Release arrives while that
+        // press is still held: Release is dropped so the hold stays intact until the physical Up.
+        let (mut engine, mut host) = setup();
+        queue_lr_wait_ended_by_x1(&mut engine, &mut host, 10, 10, 100);
+        let resent = take_resent_button_calls(&mut host);
+        assert_eq!(resent.len(), 2);
+        assert_eq!(
+            engine.handle_mouse(
+                inj_mouse(resent[0].0, resent[0].1.x, resent[0].1.y, 170, resent[0].2),
+                &mut host
+            ),
+            HookDecision::Pass
+        );
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 100, 100, 200), &mut host),
+            HookDecision::Pass
+        );
+        assert_eq!(
+            engine.handle_mouse(
+                inj_mouse(resent[1].0, resent[1].1.x, resent[1].1.y, 210, resent[1].2),
+                &mut host
+            ),
+            HookDecision::Suppress
+        );
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Left), 100, 100, 300), &mut host),
+            HookDecision::Pass
+        );
+
+        // 3. The later physical press already completed before the earlier resent Down and Release
+        // arrive: both are dropped rather than replayed out of order.
+        let (mut engine, mut host) = setup();
+        queue_lr_wait_ended_by_x1(&mut engine, &mut host, 10, 10, 100);
+        let resent = take_resent_button_calls(&mut host);
+        assert_eq!(resent.len(), 2);
         assert_eq!(
             engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 100, 100, 200), &mut host),
             HookDecision::Pass
@@ -3284,10 +3347,10 @@ mod tests {
             engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Left), 100, 100, 220), &mut host),
             HookDecision::Pass
         );
-        for (idx, (kind, pt, extra)) in resent1.into_iter().enumerate() {
+        for (idx, (kind, pt, extra)) in resent.into_iter().enumerate() {
             assert_eq!(
                 engine.handle_mouse(inj_mouse(kind, pt.x, pt.y, 230 + idx as u32, extra), &mut host),
-                HookDecision::Pass
+                HookDecision::Suppress
             );
         }
     }
