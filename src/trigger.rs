@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use crate::config::{Config, CustomTableState, Trigger, TriggerKey};
 use crate::exclusions::ExclusionMatcher;
 use crate::properties::ConfigStore;
@@ -5,6 +7,8 @@ use crate::scroll::{ScrollAxis, ScrollConfig, ScrollSession, WheelEvent};
 use crate::sender::{MouseButton, PRESS_ID_MASK, Point, ResendKind, ResendTags, ResentInfo};
 
 const KEY_COUNT: usize = 256;
+/// More presses than a sender held back that long could have queued
+const MAX_RELEASES_QUEUED: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TriggerConfig {
@@ -137,7 +141,7 @@ pub trait TriggerHost {
 
 /// What reached the application of a button's latest physical press, so that no down reaches it
 /// alone (the button left down there) and no up alone (of a down it never had)
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct Press {
     /// The id of the press, told by its resent events (ResendTags)
     id: u32,
@@ -149,8 +153,11 @@ struct Press {
     /// Its up has passed (or was dropped as a lone up, or may have been missed): a down of it
     /// resent later is dropped
     up_passed: bool,
-    /// The id of the press whose resent up (ResendKind::Release) is queued, 0 when none is
-    release_queued_id: u32,
+    /// The ids of the presses whose resent up (ResendKind::Release) is queued for their down
+    /// resent alone, in order until each up reaches the hook (evicting the oldest past
+    /// MAX_RELEASES_QUEUED). Cleared if a later physical down passes directly to the application,
+    /// so a stale resent click cannot break or reorder after that press.
+    releases_queued: VecDeque<u32>,
 }
 
 #[derive(Default)]
@@ -168,11 +175,16 @@ impl ButtonTracker {
         &mut self.presses[button.index()]
     }
 
-    fn drop_resent(&self, button: MouseButton, is_down: bool, kind: ResendKind, press_id: u32) -> bool {
-        let p = self.press(button);
+    fn drop_resent(&mut self, button: MouseButton, is_down: bool, kind: ResendKind, press_id: u32) -> bool {
+        let p = self.press_mut(button);
         match (is_down, kind) {
-            (true, ResendKind::Down) => (press_id != p.id || p.up_passed) && press_id != p.release_queued_id,
-            (false, ResendKind::Release) => press_id != p.down_passed_id,
+            (true, ResendKind::Down) => {
+                (press_id != p.id || p.up_passed) && !p.has_queued_release(press_id)
+            }
+            (false, ResendKind::Release) => {
+                p.remove_queued_release(press_id);
+                press_id != p.down_passed_id
+            }
             _ => false,
         }
     }
@@ -187,7 +199,6 @@ impl ButtonTracker {
         p.id = id;
         p.up_passed = false;
         p.down_suppressed = false;
-        p.release_queued_id = 0;
     }
 
     fn current_press_id(&self, button: MouseButton) -> u32 {
@@ -212,30 +223,37 @@ impl ButtonTracker {
     /// application then). The suppressed downs are forgotten, so the up of a press made meanwhile
     /// (which reached the application too) is not suppressed as theirs. A resent down still
     /// queued for a press whose release was not queued is dropped when it comes (as after a
-    /// passed up), or it would reach the application alone and the button stay down; one whose
-    /// release is queued passes with it (the click is whole). The press ids are kept (resent
+    /// passed up), or it would reach the application alone and the button stay down; ones whose
+    /// release is queued pass with it (the clicks are whole). The press ids are kept (resent
     /// events in flight are still told).
     fn forget_presses(&mut self) {
         for p in &mut self.presses {
             p.down_suppressed = false;
-            if p.release_queued_id != p.id {
+            if !p.has_queued_release(p.id) {
                 p.up_passed = true;
             }
         }
     }
 
     fn mark_release_queued(&mut self, button: MouseButton, press_id: u32) {
-        self.press_mut(button).release_queued_id = press_id;
+        self.press_mut(button).queue_release(press_id);
     }
 
     /// After a physical event, passed or suppressed
     fn on_after_physical(&mut self, button: MouseButton, is_down: bool, passed: bool) {
         let p = self.press_mut(button);
         match (is_down, passed) {
-            (true, true) => p.down_passed_id = p.id,
+            (true, true) => {
+                p.down_passed_id = p.id;
+                p.releases_queued.clear();
+            }
             (true, false) => p.down_suppressed = true,
-            (false, true) => p.on_up_passed(),
-            (false, false) => {}
+            (false, true) => {
+                p.down_passed_id = 0;
+                p.up_passed = true;
+                p.down_suppressed = false;
+            }
+            (false, false) => p.down_suppressed = false,
         }
     }
 
@@ -244,19 +262,29 @@ impl ButtonTracker {
         let p = self.press_mut(button);
         match (is_down, kind) {
             (true, ResendKind::Down) => p.down_passed_id = press_id,
-            (false, ResendKind::Release) => p.on_up_passed(),
+            (false, ResendKind::Release) => p.down_passed_id = 0,
             _ => {}
         }
     }
 }
 
 impl Press {
-    /// The up of the press reached the application: nothing of it is left down there
-    fn on_up_passed(&mut self) {
-        self.down_passed_id = 0;
-        self.up_passed = true;
-        self.down_suppressed = false;
-        self.release_queued_id = 0;
+    fn queue_release(&mut self, id: u32) {
+        self.remove_queued_release(id);
+        self.releases_queued.push_back(id);
+        while self.releases_queued.len() > MAX_RELEASES_QUEUED {
+            self.releases_queued.pop_front();
+        }
+    }
+
+    fn remove_queued_release(&mut self, id: u32) {
+        if let Some(pos) = self.releases_queued.iter().position(|&queued| queued == id) {
+            self.releases_queued.remove(pos);
+        }
+    }
+
+    fn has_queued_release(&self, id: u32) -> bool {
+        self.releases_queued.contains(&id)
     }
 }
 
@@ -3086,5 +3114,317 @@ mod tests {
         engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Right), 20, 20, 100), &mut host);
         engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 10, 10, 200), &mut host);
         ends_and_passes(&mut engine, &mut host, MouseButton::Right, MouseButton::Left);
+    }
+
+    /// Drives `Left↓ -> X1↓ -> Left↑ -> X1↑` at `t`..`t+60`, asserting `[Suppress, Pass, Suppress, Pass]`
+    /// so Left's wait is ended by X1 and its down and release are queued without being delivered yet.
+    fn queue_lr_wait_ended_by_x1(engine: &mut TriggerEngine, host: &mut MockHost, x: i32, y: i32, t: u32) {
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), x, y, t), host),
+            HookDecision::Suppress
+        );
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::X1), x, y, t + 20), host),
+            HookDecision::Pass
+        );
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Left), x, y, t + 40), host),
+            HookDecision::Suppress
+        );
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::X1), x, y, t + 60), host),
+            HookDecision::Pass
+        );
+    }
+
+    fn take_resent_button_calls(host: &mut MockHost) -> Vec<(HookMouseKind, Point, usize)> {
+        host.take_calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                HostCall::Down(btn, pt, extra) => Some((HookMouseKind::Down(btn), pt, extra)),
+                HostCall::Up(btn, pt, extra) => Some((HookMouseKind::Up(btn), pt, extra)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lr_waits_ended_by_another_button_while_sender_is_slow_keep_each_click() {
+        let cfg = Config {
+            first_trigger: Trigger::Lr,
+            poll_timeout: 500,
+            ..Config::default()
+        };
+        let tags = ResendTags::next_unique();
+        let mut engine = TriggerEngine::new(
+            EngineConfig::from_config(&cfg, &CustomTableState::default()),
+            tags,
+        );
+        let mut host = MockHost::new();
+
+        for t in [100, 300] {
+            queue_lr_wait_ended_by_x1(&mut engine, &mut host, 10, 10, t);
+        }
+
+        let resent = take_resent_button_calls(&mut host);
+        assert_eq!(resent.len(), 4);
+        assert_eq!(
+            resent
+                .iter()
+                .map(|(kind, _, extra)| (*kind, tags.decode(*extra)))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    HookMouseKind::Down(MouseButton::Left),
+                    Some(ResentInfo::Button { kind: ResendKind::Down, press_id: 1 })
+                ),
+                (
+                    HookMouseKind::Up(MouseButton::Left),
+                    Some(ResentInfo::Button { kind: ResendKind::Release, press_id: 1 })
+                ),
+                (
+                    HookMouseKind::Down(MouseButton::Left),
+                    Some(ResentInfo::Button { kind: ResendKind::Down, press_id: 3 })
+                ),
+                (
+                    HookMouseKind::Up(MouseButton::Left),
+                    Some(ResentInfo::Button { kind: ResendKind::Release, press_id: 3 })
+                ),
+            ]
+        );
+
+        for (idx, (kind, pt, extra)) in resent.into_iter().enumerate() {
+            assert_eq!(
+                engine.handle_mouse(inj_mouse(kind, pt.x, pt.y, 400 + idx as u32, extra), &mut host),
+                HookDecision::Pass
+            );
+        }
+    }
+
+    #[test]
+    fn queued_release_arriving_during_later_suppressed_press_keeps_both_intact() {
+        // A: a queued Release arriving while a later Left press is waiting does not mark that
+        // later press as up_passed (its timed-out Down still passes, and its Up passes).
+        let (mut engine, tags, mut host) = base_engine(Trigger::Lr);
+        queue_lr_wait_ended_by_x1(&mut engine, &mut host, 10, 10, 100);
+        let resent1 = take_resent_button_calls(&mut host);
+        assert_eq!(resent1.len(), 2);
+
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 10, 10, 200), &mut host),
+            HookDecision::Suppress
+        );
+        for (idx, (kind, pt, extra)) in resent1.into_iter().enumerate() {
+            assert_eq!(
+                engine.handle_mouse(inj_mouse(kind, pt.x, pt.y, 210 + idx as u32, extra), &mut host),
+                HookDecision::Pass
+            );
+        }
+        host.take_calls();
+        engine.on_poll_timeout(&mut host);
+        let resent2 = take_resent_button_calls(&mut host);
+        assert_eq!(resent2.len(), 1);
+        let (kind2, pt2, extra2) = resent2[0];
+        assert_eq!(
+            tags.decode(extra2),
+            Some(ResentInfo::Button {
+                kind: ResendKind::Down,
+                press_id: 3,
+            })
+        );
+        assert_eq!(
+            engine.handle_mouse(inj_mouse(kind2, pt2.x, pt2.y, 410, extra2), &mut host),
+            HookDecision::Pass
+        );
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Left), 10, 10, 420), &mut host),
+            HookDecision::Pass
+        );
+
+        // B: a queued Release arriving during a later press preserves down_suppressed, so
+        // init_state still suppresses that later press's lone physical Up.
+        let (mut engine, _tags, mut host) = base_engine(Trigger::Lr);
+        queue_lr_wait_ended_by_x1(&mut engine, &mut host, 10, 10, 100);
+        let resent1 = take_resent_button_calls(&mut host);
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 10, 10, 200), &mut host),
+            HookDecision::Suppress
+        );
+        for (idx, (kind, pt, extra)) in resent1.into_iter().enumerate() {
+            assert_eq!(
+                engine.handle_mouse(inj_mouse(kind, pt.x, pt.y, 210 + idx as u32, extra), &mut host),
+                HookDecision::Pass
+            );
+        }
+        engine.init_state(&mut host);
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Left), 10, 10, 250), &mut host),
+            HookDecision::Suppress
+        );
+    }
+
+    #[test]
+    fn passed_physical_down_drops_earlier_queued_release_so_hold_is_not_broken() {
+        use crate::exclusions::ExclusionList;
+
+        let excluded_pt = Point { x: 100, y: 100 };
+        let setup = || {
+            let cfg = Config {
+                first_trigger: Trigger::Lr,
+                ..Config::default()
+            };
+            let matcher = ExclusionList::from_lines(["C:\\Games\\game.exe"]).to_matcher();
+            let engine = TriggerEngine::new(
+                EngineConfig::from_config(&cfg, &CustomTableState::default()).with_exclusions(matcher),
+                ResendTags::next_unique(),
+            );
+            let mut host = MockHost::new();
+            host.excluded_points.push(excluded_pt);
+            (engine, host)
+        };
+
+        // 1. Resent Down and Release arrive while a later physical press on an excluded window is
+        // still held: both are dropped so the hold/drag is not released early.
+        let (mut engine, mut host) = setup();
+        queue_lr_wait_ended_by_x1(&mut engine, &mut host, 10, 10, 100);
+        let resent = take_resent_button_calls(&mut host);
+        assert_eq!(resent.len(), 2);
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 100, 100, 200), &mut host),
+            HookDecision::Pass
+        );
+        for (idx, (kind, pt, extra)) in resent.into_iter().enumerate() {
+            assert_eq!(
+                engine.handle_mouse(inj_mouse(kind, pt.x, pt.y, 210 + idx as u32, extra), &mut host),
+                HookDecision::Suppress
+            );
+        }
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Left), 100, 100, 300), &mut host),
+            HookDecision::Pass
+        );
+
+        // 2. Resent Down passed before the later physical press, then Release arrives while that
+        // press is still held: Release is dropped so the hold stays intact until the physical Up.
+        let (mut engine, mut host) = setup();
+        queue_lr_wait_ended_by_x1(&mut engine, &mut host, 10, 10, 100);
+        let resent = take_resent_button_calls(&mut host);
+        assert_eq!(resent.len(), 2);
+        assert_eq!(
+            engine.handle_mouse(
+                inj_mouse(resent[0].0, resent[0].1.x, resent[0].1.y, 170, resent[0].2),
+                &mut host
+            ),
+            HookDecision::Pass
+        );
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 100, 100, 200), &mut host),
+            HookDecision::Pass
+        );
+        assert_eq!(
+            engine.handle_mouse(
+                inj_mouse(resent[1].0, resent[1].1.x, resent[1].1.y, 210, resent[1].2),
+                &mut host
+            ),
+            HookDecision::Suppress
+        );
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Left), 100, 100, 300), &mut host),
+            HookDecision::Pass
+        );
+
+        // 3. The later physical press already completed before the earlier resent Down and Release
+        // arrive: both are dropped rather than replayed out of order.
+        let (mut engine, mut host) = setup();
+        queue_lr_wait_ended_by_x1(&mut engine, &mut host, 10, 10, 100);
+        let resent = take_resent_button_calls(&mut host);
+        assert_eq!(resent.len(), 2);
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 100, 100, 200), &mut host),
+            HookDecision::Pass
+        );
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::Left), 100, 100, 220), &mut host),
+            HookDecision::Pass
+        );
+        for (idx, (kind, pt, extra)) in resent.into_iter().enumerate() {
+            assert_eq!(
+                engine.handle_mouse(inj_mouse(kind, pt.x, pt.y, 230 + idx as u32, extra), &mut host),
+                HookDecision::Suppress
+            );
+        }
+    }
+
+    #[test]
+    fn queued_releases_evict_oldest_past_limit_and_clean_up_on_dropped_release_and_hook_loss() {
+        // 1. Beyond MAX_RELEASES_QUEUED, the oldest queued press is evicted while the newest 16
+        // keep their clicks intact.
+        let (mut engine, _tags, mut host) = base_engine(Trigger::Lr);
+        for i in 0..=MAX_RELEASES_QUEUED {
+            queue_lr_wait_ended_by_x1(&mut engine, &mut host, 10, 10, 100 + (i as u32) * 100);
+        }
+        let resent = take_resent_button_calls(&mut host);
+        assert_eq!(resent.len(), (MAX_RELEASES_QUEUED + 1) * 2);
+        for (idx, (kind, pt, extra)) in resent.into_iter().enumerate() {
+            let expected = if idx < 2 {
+                HookDecision::Suppress
+            } else {
+                HookDecision::Pass
+            };
+            assert_eq!(
+                engine.handle_mouse(inj_mouse(kind, pt.x, pt.y, 5000 + idx as u32, extra), &mut host),
+                expected
+            );
+        }
+
+        // 2. When a Release is dropped (e.g. arrived without its Down passing), it is removed from
+        // releases_queued so its Down arriving later is also dropped rather than left stuck down.
+        let (mut engine, _tags, mut host) = base_engine(Trigger::Lr);
+        queue_lr_wait_ended_by_x1(&mut engine, &mut host, 10, 10, 100);
+        let resent = take_resent_button_calls(&mut host);
+        assert_eq!(resent.len(), 2);
+        let (down_kind, down_pt, down_extra) = resent[0];
+        let (rel_kind, rel_pt, rel_extra) = resent[1];
+        assert_eq!(
+            engine.handle_mouse(inj_mouse(rel_kind, rel_pt.x, rel_pt.y, 200, rel_extra), &mut host),
+            HookDecision::Suppress
+        );
+        assert_eq!(
+            engine.handle_mouse(inj_mouse(down_kind, down_pt.x, down_pt.y, 210, down_extra), &mut host),
+            HookDecision::Suppress
+        );
+
+        // 3. on_mouse_hook_lost keeps queued full clicks across multiple presses while dropping a
+        // subsequent Down whose Release was never queued.
+        let (mut engine, _tags, mut host) = base_engine(Trigger::Lr);
+        queue_lr_wait_ended_by_x1(&mut engine, &mut host, 10, 10, 100);
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::Left), 10, 10, 200), &mut host),
+            HookDecision::Suppress
+        );
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Down(MouseButton::X1), 10, 10, 220), &mut host),
+            HookDecision::Pass
+        );
+        assert_eq!(
+            engine.handle_mouse(phys_mouse(HookMouseKind::Up(MouseButton::X1), 10, 10, 240), &mut host),
+            HookDecision::Pass
+        );
+        let resent = take_resent_button_calls(&mut host);
+        assert_eq!(resent.len(), 3);
+
+        engine.on_mouse_hook_lost(&mut host);
+        assert_eq!(
+            engine.handle_mouse(inj_mouse(resent[0].0, resent[0].1.x, resent[0].1.y, 300, resent[0].2), &mut host),
+            HookDecision::Pass
+        );
+        assert_eq!(
+            engine.handle_mouse(inj_mouse(resent[1].0, resent[1].1.x, resent[1].1.y, 310, resent[1].2), &mut host),
+            HookDecision::Pass
+        );
+        assert_eq!(
+            engine.handle_mouse(inj_mouse(resent[2].0, resent[2].1.x, resent[2].1.y, 320, resent[2].2), &mut host),
+            HookDecision::Suppress
+        );
     }
 }
